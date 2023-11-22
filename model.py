@@ -1,5 +1,7 @@
+from apex.transformer import tensor_parallel
+from apex.transformer import parallel_state
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 import math
 import torch
 import torch.nn as nn
@@ -21,15 +23,42 @@ class ModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 2048
 
-    device: str = None
+    device: Optional[str] = None
+
+
+class ColumnParallelLinear(tensor_parallel.ColumnParallelLinear):
+    def __init__(self, in_dim, out_dim, dtype=torch.float32):
+        super().__init__(
+            in_dim,
+            out_dim,
+            bias=False,
+            gather_output=False,
+            params_dtype=dtype,
+            sequence_parallel_enabled=False,
+            no_async_tensor_model_parallel_allreduce=False,
+        )
+
+
+
+class RowParallelLinear(tensor_parallel.RowParallelLinear):
+    def __init__(self, in_dim, out_dim, dtype=torch.float32):
+        super().__init__(
+            in_dim,
+            out_dim,
+            bias=False,
+            input_is_parallel=True,
+            params_dtype=dtype,
+            sequence_parallel_enabled=False
+        )
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6,
+                 device: Optional[str] = None, dtype: torch.dtype = torch.float32):
         super().__init__()
         self.eps = eps
         # The gamma parameter
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim, dtype=dtype, device=device))
 
     def _norm(self, x: torch.Tensor):
         # (B, Seq_Len, Dim) * (B, Seq_Len, 1) = (B, Seq_Len, Dim)
@@ -97,7 +126,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, dtype: torch.dtype):
         super().__init__()
 
         # Indicates the number of heads for the Keys and Values
@@ -109,13 +138,20 @@ class SelfAttention(nn.Module):
         # Indicates the dimension of each head, that is, the part of the embedding that each head will be responsible for
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        self.wq = ColumnParallelLinear(
+            args.dim, args.n_heads * self.head_dim, dtype=dtype)
+        self.wk = ColumnParallelLinear(
+            args.dim, self.n_kv_heads * self.head_dim, dtype=dtype)
+        self.wv = ColumnParallelLinear(
+            args.dim, self.n_kv_heads * self.head_dim, dtype=dtype)
+        self.wo = RowParallelLinear(
+            args.n_heads * self.head_dim, args.dim, dtype=dtype)
 
-        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
-        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
+        # causes OOM, should be stored outside the class anyway
+#         self.cache_k = torch.zeros(
+#             (args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim), dtype=dtype)
+#         self.cache_v = torch.zeros(
+#             (args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim), dtype=dtype)
 
     def forward(
         self,
@@ -123,6 +159,7 @@ class SelfAttention(nn.Module):
         start_pos: int,
         freqs_complex: torch.Tensor
     ):
+        # TODO fix this
         batch_size, seq_len, _ = x.shape  # (B, 1, Dim)
 
         # (B, 1, Dim) -> (B, 1, H_Q * Head_Dim)
@@ -182,7 +219,8 @@ class SelfAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(
         self,
-        args: ModelArgs
+        args: ModelArgs,
+        dtype: torch.dtype
     ):
         super().__init__()
 
@@ -193,9 +231,9 @@ class FeedForward(nn.Module):
         # Round the hidden_dim to the nearest multiple of the multiple_of parameter
         hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of - 1) // args.multiple_of)
 
-        self.w1 = nn.Linear(args.dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, args.dim, bias=False)
-        self.w3 = nn.Linear(args.dim, hidden_dim, bias=False)
+        self.w1 = ColumnParallelLinear(args.dim, hidden_dim, dtype=dtype)
+        self.w2 = RowParallelLinear(hidden_dim, args.dim, dtype=dtype)
+        self.w3 = ColumnParallelLinear(args.dim, hidden_dim, dtype=dtype)
 
     def forward(self, x: torch.Tensor):
         # (B, Seq_Len, Dim) --> (B, Seq_Len, Hidden_Dim)
@@ -211,20 +249,22 @@ class FeedForward(nn.Module):
 
 class EncoderBlock(nn.Module):
 
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, dtype: torch.dtype):
         super().__init__()
 
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
 
-        self.attention = SelfAttention(args)
-        self.feed_forward = FeedForward(args)
+        self.attention = SelfAttention(args, dtype)
+        self.feed_forward = FeedForward(args, dtype)
 
         # Normalization BEFORE the attention block
-        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps,
+                                      dtype=dtype, device=args.device)
         # Normalization BEFORE the feed forward block
-        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps,
+                                dtype=dtype, device=args.device)
     
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
         # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
@@ -234,25 +274,38 @@ class EncoderBlock(nn.Module):
         # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
+
     
 class Transformer(nn.Module):
 
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, dtype: torch.dtype):
         super().__init__()
 
         assert args.vocab_size != -1, "Vocab size must be set"
+        
+        self.pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        self.pp_world = parallel_state.get_pipeline_model_parallel_world_size()
 
         self.args = args
         self.vocab_size = args.vocab_size
         self.n_layers = args.n_layers
-        self.tok_embeddings = nn.Embedding(self.vocab_size, args.dim)
+        if self.pp_rank == 0:
+            self.tok_embeddings = tensor_parallel.VocabParallelEmbedding(
+                self.vocab_size, args.dim, params_dtype=dtype)
 
-        self.layers = nn.ModuleList()
-        for layer_id in range(args.n_layers):
-            self.layers.append(EncoderBlock(args))
+        self.layers = nn.ModuleDict()
+        n_layers = args.n_layers
+        layers_per_pp = n_layers // self.pp_world
+        self.layers_start = layers_per_pp * self.pp_rank
+        self.layers_end = layers_per_pp * (self.pp_rank + 1)
+        for layer_id in range(self.layers_start, self.layers_end):
+            self.layers[str(layer_id)] = EncoderBlock(args, dtype)
 
-        self.norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.output = nn.Linear(args.dim, self.vocab_size, bias=False)
+        if self.pp_rank == self.pp_world - 1:
+            self.norm = RMSNorm(args.dim, eps=args.norm_eps, dtype=dtype,
+                                device=args.device)
+            self.output = ColumnParallelLinear(
+                args.dim, self.vocab_size, dtype=dtype)
 
         self.freqs_complex = precompute_theta_pos_frequencies(self.args.dim // self.args.n_heads, self.args.max_seq_len * 2, device=self.args.device)
 
@@ -261,15 +314,37 @@ class Transformer(nn.Module):
         batch_size, seq_len = tokens.shape
         assert seq_len == 1, "Only one token at a time can be processed"
 
-        # (B, Seq_Len) -> (B, Seq_Len, Dim)
-        h = self.tok_embeddings(tokens)
+        if self.pp_rank == 0:
+            # (B, Seq_Len) -> (B, Seq_Len, Dim)
+            h = self.tok_embeddings(tokens)
 
         # Retrieve the pairs (m, theta) corresponding to the positions [start_pos, start_pos + seq_len]
         freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]
         
         # Consecutively apply all the encoder layers
-        for layer in self.layers:
+        for layer_id in range(self.layers_start, self.layers_end):
+            layer = self.layers[layer_id]
             h = layer(h, start_pos, freqs_complex)
-        h = self.norm(h)
-        output = self.output(h).float()
+        if self.pp_rank == self.pp_world - 1:
+            h = self.norm(h)
+            output = self.output(h).float()
         return output
+
+
+class PipelineStage(nn.Module):
+    input_tensors: Optional[List[torch.Tensor]] = None
+
+    def __init__(self, module):
+        super().__init__()
+        self.input_tensors = None
+        self.wrapped = module
+
+    def set_input_tensor(self, tensor: List[torch.Tensor]):
+        self.input_tensors = tensor
+
+    def forward(self, *x, **kwargs):
+        if parallel_state.is_pipeline_first_stage():
+            inputs = x
+        else:
+            inputs = self.input_tensors
+        return self.wrapped(*inputs, **kwargs)
