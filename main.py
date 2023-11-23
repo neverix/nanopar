@@ -31,7 +31,7 @@ def set_random_seed(seed: int):
 
 # I don't understand why all the extra stuff will needed so I'll run it to see why
 def loss_fn(pred, label):
-    return vocab_parallel_cross_entropy(pred, label).mean(), {}
+    return tensor_parallel.vocab_parallel_cross_entropy(pred, label).mean(), {}
     
     
 def train_step(batch, model):
@@ -84,8 +84,8 @@ def main(llama_path=Path("llama-2-7b")):
                         virtual_pipeline_model_parallel_size,
                         args=llama_args)
     
-    global_batch_size = 64
-    micro_batch_size = 4
+    global_batch_size = 1
+    micro_batch_size = 1
     setup_microbatch_calculator(
         rank=rank,
         rampup_batch_size=None,
@@ -114,15 +114,16 @@ def main(llama_path=Path("llama-2-7b")):
         store_params=False,
     )
     
-    batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, llama_args.max_seq_len), device="cuda")
+    seq_len = 16  # llama_args.max_seq_len
+    batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
     optimizer.zero_grad()
     loss = forward_backward_func(
         train_step,
         batch,
         models,
         forward_only=False,
-        # IO shape?
-        tensor_shape=(llama_args.max_seq_len, micro_batch_size, llama_args.dim),
+        # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
+        tensor_shape=(micro_batch_size, seq_len - 1, llama_args.dim),
         # T4 doesn't have bfloat16
         dtype=torch.float16,
         async_comm=True,

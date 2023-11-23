@@ -37,7 +37,11 @@ class ColumnParallelLinear(tensor_parallel.ColumnParallelLinear):
             sequence_parallel_enabled=False,
             no_async_tensor_model_parallel_allreduce=False,
         )
-
+    
+    def forward(self, x):
+        # ignore bias
+        result, _ = super().forward(x)
+        return result
 
 
 class RowParallelLinear(tensor_parallel.RowParallelLinear):
@@ -50,6 +54,11 @@ class RowParallelLinear(tensor_parallel.RowParallelLinear):
             params_dtype=dtype,
             sequence_parallel_enabled=False
         )
+    
+    def forward(self, x):
+        # ignore bias
+        result, _ = super().forward(x)
+        return result
 
 
 class RMSNorm(nn.Module):
@@ -126,7 +135,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, args: ModelArgs, dtype: torch.dtype):
+    def __init__(self, args: ModelArgs, dtype: torch.dtype, use_sdp: bool = True):
         super().__init__()
 
         # Indicates the number of heads for the Keys and Values
@@ -146,12 +155,8 @@ class SelfAttention(nn.Module):
             args.dim, self.n_kv_heads * self.head_dim, dtype=dtype)
         self.wo = RowParallelLinear(
             args.n_heads * self.head_dim, args.dim, dtype=dtype)
-
-        # causes OOM, should be stored outside the class anyway
-#         self.cache_k = torch.zeros(
-#             (args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim), dtype=dtype)
-#         self.cache_v = torch.zeros(
-#             (args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim), dtype=dtype)
+        
+        self.use_sdp = use_sdp
 
     def forward(
         self,
@@ -160,35 +165,31 @@ class SelfAttention(nn.Module):
         freqs_complex: torch.Tensor
     ):
         # TODO fix this
-        batch_size, seq_len, _ = x.shape  # (B, 1, Dim)
+        batch_size, seq_len, _ = x.shape  # (B, Seq_Len, Dim)
 
-        # (B, 1, Dim) -> (B, 1, H_Q * Head_Dim)
+        # (B, Seq_Len, Dim) -> (B, Seq_Len, H_Q * Head_Dim)
         xq = self.wq(x)
-        # (B, 1, Dim) -> (B, 1, H_KV * Head_Dim)
+        # (B, Seq_Len, Dim) -> (B, Seq_Len, H_KV * Head_Dim)
         xk = self.wk(x)
-        # (B, 1, Dim) -> (B, 1, H_KV * Head_Dim)
+        # (B, Seq_Len, Dim) -> (B, Seq_Len, H_KV * Head_Dim)
         xv = self.wv(x)
 
-        # (B, 1, H_Q * Head_Dim) -> (B, 1, H_Q, Head_Dim)
+        # (B, Seq_Len, H_Q * Head_Dim) -> (B, Seq_Len, H_Q, Head_Dim)
         xq = xq.view(batch_size, seq_len, self.n_heads_q, self.head_dim)
-        # (B, 1, H_KV * Head_Dim) -> (B, 1, H_KV, Head_Dim)
+        # (B, Seq_Len, H_KV * Head_Dim) -> (B, Seq_Len, H_KV, Head_Dim)
         xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
-        # (B, 1, H_KV * Head_Dim) -> (B, 1, H_KV, Head_Dim)
+        # (B, Seq_Len, H_KV * Head_Dim) -> (B, Seq_Len, H_KV, Head_Dim)
         xv = xv.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
 
-        # (B, 1, H_Q, Head_Dim) --> (B, 1, H_Q, Head_Dim)
+        # (B, Seq_Len, H_Q, Head_Dim) --> (B, Seq_Len, H_Q, Head_Dim)
         xq = apply_rotary_embeddings(xq, freqs_complex, device=x.device)
-        # (B, 1, H_KV, Head_Dim) --> (B, 1, H_KV, Head_Dim)
+        # (B, Seq_Len, H_KV, Head_Dim) --> (B, Seq_Len, H_KV, Head_Dim)
         xk = apply_rotary_embeddings(xk, freqs_complex, device=x.device)
 
-        # Replace the entry in the cache
-        self.cache_k[:batch_size, start_pos : start_pos + seq_len] = xk
-        self.cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
-
         # (B, Seq_Len_KV, H_KV, Head_Dim)
-        keys = self.cache_k[:batch_size, : start_pos + seq_len]
+        keys = xk
         # (B, Seq_Len_KV, H_KV, Head_Dim)
-        values = self.cache_v[:batch_size, : start_pos + seq_len]
+        values = xv
 
         # Since every group of Q shares the same K and V heads, just repeat the K and V heads for every Q in the same group.
 
@@ -197,23 +198,30 @@ class SelfAttention(nn.Module):
         # (B, Seq_Len_KV, H_KV, Head_Dim) --> (B, Seq_Len_KV, H_Q, Head_Dim)
         values = repeat_kv(values, self.n_rep)
 
-        # (B, 1, H_Q, Head_Dim) -> (B, H_Q, 1, Head_Dim)
+        # (B, Seq_Len, H_Q, Head_Dim) -> (B, H_Q, Seq_Len, Head_Dim)
         xq = xq.transpose(1, 2)
         # (B, Seq_Len_KV, H_Q, Head_Dim) -> (B, H_Q, Seq_Len_KV, Head_Dim)
         keys = keys.transpose(1, 2)
         # (B, Seq_Len_KV, H_Q, Head_Dim) -> (B, H_Q, Seq_Len_KV, Head_Dim)
         values = values.transpose(1, 2)
 
-        # (B, H_Q, 1, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        # (B, H_Q, 1, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        if not self.use_sdp:
+            raise NotImplementedError("Stop using vanilla attention. Get some help.")
+            
+            # (B, H_Q, Seq_Len, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len_KV) -> (B, H_Q, Seq_Len, Seq_Len_KV)
+            scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+            scores = scores - (torch.arange(scores.shape[-2]).unsqueeze(-1).to(scores)
+                               >= torch.arange(scores.shape[-1]).unsqueeze(-2).to(scores)) * torch.inf
+            # (B, H_Q, Seq_Len, Seq_Len_KV) -> (B, H_Q, Seq_Len, Seq_Len_KV)
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
 
-        # (B, H_Q, 1, Seq_Len) @ (B, H_Q, Seq_Len_KV, Head_Dim) -> (B, H_Q, 1, Head_Dim)
-        output = torch.matmul(scores, values)
-        # (B, H_Q, 1, Head_Dim) -> (B, 1, H_Q, Head_Dim) -> (B, 1, Dim)
+            # (B, H_Q, Seq_Len, Seq_Len_KV) @ (B, H_Q, Seq_Len_KV, Head_Dim) -> (B, H_Q, Seq_Len, Head_Dim)
+            output = torch.matmul(scores, values)
+        else:
+            output = F.scaled_dot_product_attention(xq, keys, values, is_causal=True)
+        # (B, H_Q, Seq_Len, Head_Dim) -> (B, Seq_Len, H_Q, Head_Dim) -> (B, Seq_Len, Dim)
         output = (output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1))
-        return self.wo(output) # (B, 1, Dim) -> (B, 1, Dim)
+        return self.wo(output) # (B, Seq_Len, Dim) -> (B, Seq_Len, Dim)
 
 
 class FeedForward(nn.Module):
@@ -267,12 +275,17 @@ class EncoderBlock(nn.Module):
                                 dtype=dtype, device=args.device)
     
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
-        # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
-        h = x + self.attention.forward(
+        # (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
+        attn_out = self.attention(
             self.attention_norm(x), start_pos, freqs_complex
         )
         # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
-        out = h + self.feed_forward.forward(self.ffn_norm(h))
+        h = x + attn_out
+        
+        # (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
+        mlp_out = self.feed_forward(self.ffn_norm(h))
+        # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
+        out = h + mlp_out
         return out
 
     
@@ -311,23 +324,26 @@ class Transformer(nn.Module):
 
     def forward(self, tokens: torch.Tensor, start_pos: int):
         # (B, Seq_Len)
-        batch_size, seq_len = tokens.shape
-        assert seq_len == 1, "Only one token at a time can be processed"
+        batch_size, seq_len, *_ = tokens.shape
 
         if self.pp_rank == 0:
             # (B, Seq_Len) -> (B, Seq_Len, Dim)
             h = self.tok_embeddings(tokens)
+        else:
+            h = tokens
 
         # Retrieve the pairs (m, theta) corresponding to the positions [start_pos, start_pos + seq_len]
         freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]
         
         # Consecutively apply all the encoder layers
         for layer_id in range(self.layers_start, self.layers_end):
-            layer = self.layers[layer_id]
+            layer = self.layers[str(layer_id)]
             h = layer(h, start_pos, freqs_complex)
         if self.pp_rank == self.pp_world - 1:
             h = self.norm(h)
             output = self.output(h).float()
+        else:
+            output = h
         return output
 
 
