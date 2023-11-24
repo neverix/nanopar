@@ -1,5 +1,5 @@
 from apex.transformer.pipeline_parallel import get_forward_backward_func, build_model
-from apex.transformer.pipeline_parallel.utils import setup_microbatch_calculator
+from apex.transformer.pipeline_parallel.utils import setup_microbatch_calculator, average_losses_across_data_parallel_group
 from apex.transformer import parallel_state, tensor_parallel
 from apex.contrib.optimizers.distributed_fused_adam import DistributedFusedAdam
 from apex.optimizers.fused_adam import FusedAdam
@@ -29,14 +29,16 @@ def set_random_seed(seed: int):
     tensor_parallel.model_parallel_cuda_manual_seed(seed)
 
 
-# I don't understand why all the extra stuff will needed so I'll run it to see why
 def loss_fn(pred, label):
-    return tensor_parallel.vocab_parallel_cross_entropy(pred, label).mean(), {}
+    loss = tensor_parallel.vocab_parallel_cross_entropy(pred, label)
+    loss = loss.sum()
+    # loss = average_losses_across_data_parallel_group([loss])
+    return loss, {}
     
     
 def train_step(batch, model):
     out = model(batch[:, :-1], start_pos=0)
-    label = batch[:, 1:]
+    label = batch[:, 1:].transpose(0, 1)
     return out, lambda pred: loss_fn(pred, label)
 
 
@@ -96,8 +98,12 @@ def main(llama_path=Path("llama-2-7b")):
     forward_backward_func = get_forward_backward_func(
         virtual_pipeline_model_parallel_size, pipeline_model_parallel_size)
     wrap_with_ddp = True
+    use_sp = True
     set_random_seed(12)
-    models = build_model(lambda args, **kwargs: PipelineStage(Transformer(args, dtype=torch.float16)),
+    models = build_model(lambda args, **kwargs:
+                         PipelineStage(Transformer(args,
+                                                   dtype=torch.float16,
+                                                   use_sp=use_sp)),
                         wrap_with_ddp,
                         virtual_pipeline_model_parallel_size,
                         args=llama_args)
@@ -142,12 +148,12 @@ def main(llama_path=Path("llama-2-7b")):
         models,
         forward_only=False,
         # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
-        tensor_shape=(micro_batch_size, seq_len - 1, llama_args.dim),
+        tensor_shape=(seq_len - 1, micro_batch_size, llama_args.dim),
         # T4 doesn't have bfloat16
         dtype=torch.float16,
         async_comm=True,
         sync_batch_comm=False,
-        sequence_parallel_enabled=False,
+        sequence_parallel_enabled=use_sp,
     )
     optimizer.step()
     torch.distributed.barrier()

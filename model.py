@@ -1,3 +1,4 @@
+from apex.normalization import FusedRMSNorm
 from apex.transformer import tensor_parallel
 from apex.transformer import parallel_state
 from dataclasses import dataclass
@@ -27,15 +28,15 @@ class ModelArgs:
 
 
 class ColumnParallelLinear(tensor_parallel.ColumnParallelLinear):
-    def __init__(self, in_dim, out_dim, dtype=torch.float32):
+    def __init__(self, in_dim, out_dim, dtype=torch.float32, use_sp: bool = False):
         super().__init__(
             in_dim,
             out_dim,
             bias=False,
             gather_output=False,
             params_dtype=dtype,
-            sequence_parallel_enabled=False,
-            no_async_tensor_model_parallel_allreduce=False,
+            sequence_parallel_enabled=use_sp,
+            no_async_tensor_model_parallel_allreduce=use_sp,
         )
     
     def forward(self, x):
@@ -45,14 +46,14 @@ class ColumnParallelLinear(tensor_parallel.ColumnParallelLinear):
 
 
 class RowParallelLinear(tensor_parallel.RowParallelLinear):
-    def __init__(self, in_dim, out_dim, dtype=torch.float32):
+    def __init__(self, in_dim, out_dim, dtype=torch.float32, use_sp: bool = False):
         super().__init__(
             in_dim,
             out_dim,
             bias=False,
             input_is_parallel=True,
             params_dtype=dtype,
-            sequence_parallel_enabled=False
+            sequence_parallel_enabled=use_sp
         )
     
     def forward(self, x):
@@ -61,22 +62,17 @@ class RowParallelLinear(tensor_parallel.RowParallelLinear):
         return result
 
 
-class RMSNorm(nn.Module):
+class RMSNorm(FusedRMSNorm):
     def __init__(self, dim: int, eps: float = 1e-6,
-                 device: Optional[str] = None, dtype: torch.dtype = torch.float32):
-        super().__init__()
-        self.eps = eps
-        # The gamma parameter
-        self.weight = nn.Parameter(torch.ones(dim, dtype=dtype, device=device))
-
-    def _norm(self, x: torch.Tensor):
-        # (B, Seq_Len, Dim) * (B, Seq_Len, 1) = (B, Seq_Len, Dim)
-        # rsqrt: 1 / sqrt(x)
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+                 dtype: torch.dtype = torch.float32, use_sp: bool = False):
+        super().__init__(dim, eps=eps)
+        self.weight.to(dtype)
+        if use_sp:
+            self.weight.sequence_parallel_enabled = use_sp
 
     def forward(self, x: torch.Tensor):
         # (Dim) * (B, Seq_Len, Dim) = (B, Seq_Len, Dim)
-        return self.weight * self._norm(x.float()).type_as(x)
+        return super().forward(x)
 
 
 def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, theta: float = 10000.0):
@@ -135,7 +131,8 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, args: ModelArgs, dtype: torch.dtype, use_sdp: bool = True):
+    def __init__(self, args: ModelArgs, dtype: torch.dtype,
+                 use_sp: bool=True, use_sdp: bool = True):
         super().__init__()
         
         self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
@@ -149,13 +146,13 @@ class SelfAttention(nn.Module):
         self.head_dim = args.dim // args.n_heads
 
         self.wq = ColumnParallelLinear(
-            args.dim, args.n_heads * self.head_dim, dtype=dtype)
+            args.dim, args.n_heads * self.head_dim, dtype=dtype, use_sp=use_sp)
         self.wk = ColumnParallelLinear(
-            args.dim, self.n_kv_heads * self.head_dim, dtype=dtype)
+            args.dim, self.n_kv_heads * self.head_dim, dtype=dtype, use_sp=use_sp)
         self.wv = ColumnParallelLinear(
-            args.dim, self.n_kv_heads * self.head_dim, dtype=dtype)
+            args.dim, self.n_kv_heads * self.head_dim, dtype=dtype, use_sp=use_sp)
         self.wo = RowParallelLinear(
-            args.n_heads * self.head_dim, args.dim, dtype=dtype)
+            args.n_heads * self.head_dim, args.dim, dtype=dtype, use_sp=use_sp)
         
         self.use_sdp = use_sdp
 
@@ -166,21 +163,23 @@ class SelfAttention(nn.Module):
         freqs_complex: torch.Tensor
     ):
         # TODO fix this
-        batch_size, seq_len, _ = x.shape  # (B, Seq_Len, Dim)
+        seq_len, batch_size, _ = x.shape  # (B, Seq_Len, Dim)
 
-        # (B, Seq_Len, Dim) -> (B, Seq_Len, H_Q * Head_Dim)
+        # (Seq_Len, B, Dim) -> (Seq_Len, B, H_Q * Head_Dim)
         xq = self.wq(x)
-        # (B, Seq_Len, Dim) -> (B, Seq_Len, H_KV * Head_Dim)
+        # (Seq_Len, B, Dim) -> (Seq_Len, B, H_KV * Head_Dim)
         xk = self.wk(x)
-        # (B, Seq_Len, Dim) -> (B, Seq_Len, H_KV * Head_Dim)
+        # (Seq_Len, B, Dim) -> (Seq_Len, B, H_KV * Head_Dim)
         xv = self.wv(x)
-
-        # (B, Seq_Len, H_Q * Head_Dim) -> (B, Seq_Len, H_Q, Head_Dim)
-        xq = xq.view(batch_size, seq_len, self.n_heads_q // self.tp_size, self.head_dim)
-        # (B, Seq_Len, H_KV * Head_Dim) -> (B, Seq_Len, H_KV, Head_Dim)
-        xk = xk.view(batch_size, seq_len, self.n_kv_heads // self.tp_size, self.head_dim)
-        # (B, Seq_Len, H_KV * Head_Dim) -> (B, Seq_Len, H_KV, Head_Dim)
-        xv = xv.view(batch_size, seq_len, self.n_kv_heads // self.tp_size, self.head_dim)
+        # Dimension gets multiplied by 2 during SP?..
+        seq_len = xq.shape[0]
+        
+        # (Seq_Len, B, H_Q * Head_Dim) -> (B, Seq_Len, H_Q, Head_Dim)
+        xq = xq.transpose(0, 1).reshape(batch_size, seq_len, self.n_heads_q // self.tp_size, self.head_dim)
+        # (Seq_Len, B, H_KV * Head_Dim) -> (B, Seq_Len, H_KV, Head_Dim)
+        xk = xk.transpose(0, 1).reshape(batch_size, seq_len, self.n_kv_heads // self.tp_size, self.head_dim)
+        # (Seq_Len, B, H_KV * Head_Dim) -> (B, Seq_Len, H_KV, Head_Dim)
+        xv = xv.transpose(0, 1).reshape(batch_size, seq_len, self.n_kv_heads // self.tp_size, self.head_dim)
 
         # (B, Seq_Len, H_Q, Head_Dim) --> (B, Seq_Len, H_Q, Head_Dim)
         xq = apply_rotary_embeddings(xq, freqs_complex, device=x.device)
@@ -225,14 +224,17 @@ class SelfAttention(nn.Module):
                 output = F.scaled_dot_product_attention(xq, keys, values, is_causal=True)
         # (B, H_Q, Seq_Len, Head_Dim) -> (B, Seq_Len, H_Q, Head_Dim) -> (B, Seq_Len, Dim)
         output = (output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1))
-        return self.wo(output) # (B, Seq_Len, Dim) -> (B, Seq_Len, Dim)
+        # (B, Seq_Len, Dim) -> ((Seq_Len, B, Dim)
+        output = output.transpose(0, 1)
+        return self.wo(output) # (Seq_Len, B, Dim) -> (Seq_Len, B, Dim)
 
 
 class FeedForward(nn.Module):
     def __init__(
         self,
         args: ModelArgs,
-        dtype: torch.dtype
+        dtype: torch.dtype,
+        use_sp: bool
     ):
         super().__init__()
 
@@ -243,9 +245,9 @@ class FeedForward(nn.Module):
         # Round the hidden_dim to the nearest multiple of the multiple_of parameter
         hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of - 1) // args.multiple_of)
 
-        self.w1 = ColumnParallelLinear(args.dim, hidden_dim, dtype=dtype)
-        self.w2 = RowParallelLinear(hidden_dim, args.dim, dtype=dtype)
-        self.w3 = ColumnParallelLinear(args.dim, hidden_dim, dtype=dtype)
+        self.w1 = ColumnParallelLinear(args.dim, hidden_dim, dtype=dtype, use_sp=use_sp)
+        self.w2 = RowParallelLinear(hidden_dim, args.dim, dtype=dtype, use_sp=use_sp)
+        self.w3 = ColumnParallelLinear(args.dim, hidden_dim, dtype=dtype, use_sp=use_sp)
 
     def forward(self, x: torch.Tensor):
         # (B, Seq_Len, Dim) --> (B, Seq_Len, Hidden_Dim)
@@ -261,22 +263,22 @@ class FeedForward(nn.Module):
 
 class EncoderBlock(nn.Module):
 
-    def __init__(self, args: ModelArgs, dtype: torch.dtype):
+    def __init__(self, args: ModelArgs, dtype: torch.dtype, use_sp: bool = False):
         super().__init__()
 
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
 
-        self.attention = SelfAttention(args, dtype)
-        self.feed_forward = FeedForward(args, dtype)
+        self.attention = SelfAttention(args, dtype, use_sp)
+        self.feed_forward = FeedForward(args, dtype, use_sp)
 
         # Normalization BEFORE the attention block
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps,
-                                      dtype=dtype, device=args.device)
+                                      dtype=dtype, use_sp=use_sp)
         # Normalization BEFORE the feed forward block
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps,
-                                dtype=dtype, device=args.device)
+                                dtype=dtype, use_sp=use_sp)
     
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
         # (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
@@ -295,13 +297,14 @@ class EncoderBlock(nn.Module):
     
 class Transformer(nn.Module):
 
-    def __init__(self, args: ModelArgs, dtype: torch.dtype):
+    def __init__(self, args: ModelArgs, dtype: torch.dtype, use_sp: bool):
         super().__init__()
 
         assert args.vocab_size != -1, "Vocab size must be set"
-        
+        self.use_sp = use_sp
         self.pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         self.pp_world = parallel_state.get_pipeline_model_parallel_world_size()
+        self.tp_world = parallel_state.get_tensor_model_parallel_world_size()
 
         self.args = args
         self.vocab_size = args.vocab_size
@@ -316,28 +319,36 @@ class Transformer(nn.Module):
         self.layers_start = layers_per_pp * self.pp_rank
         self.layers_end = layers_per_pp * (self.pp_rank + 1)
         for layer_id in range(self.layers_start, self.layers_end):
-            self.layers[str(layer_id)] = EncoderBlock(args, dtype)
+            self.layers[str(layer_id)] = EncoderBlock(args, dtype, use_sp=use_sp)
 
         if self.pp_rank == self.pp_world - 1:
-            self.norm = RMSNorm(args.dim, eps=args.norm_eps, dtype=dtype,
-                                device=args.device)
+            self.norm = RMSNorm(args.dim, eps=args.norm_eps, dtype=dtype, use_sp=use_sp)
             self.output = ColumnParallelLinear(
-                args.dim, self.vocab_size, dtype=dtype)
+                args.dim, self.vocab_size, dtype=dtype, use_sp=use_sp)
 
-        self.freqs_complex = precompute_theta_pos_frequencies(self.args.dim // self.args.n_heads, self.args.max_seq_len * 2, device=self.args.device)
+        self.freqs_complex = precompute_theta_pos_frequencies(self.args.dim // self.args.n_heads,
+                                                              self.args.max_seq_len * 2
+                                                              * (self.tp_world if use_sp else 1),
+                                                              device=self.args.device)
 
     def forward(self, tokens: torch.Tensor, start_pos: int):
-        # (B, Seq_Len)
-        batch_size, seq_len, *_ = tokens.shape
-
         if self.pp_rank == 0:
             # (B, Seq_Len) -> (B, Seq_Len, Dim)
             h = self.tok_embeddings(tokens)
+            # (B, Seq_Len, Dim) -> (Seq_Len, B, Dim)
+            h = h.transpose(0, 1)
+            if self.use_sp:
+                h = tensor_parallel.scatter_to_sequence_parallel_region(h)
         else:
             h = tokens
+        
+        # (B, Seq_Len)
+        seq_len, batch_size, *_ = h.shape
 
         # Retrieve the pairs (m, theta) corresponding to the positions [start_pos, start_pos + seq_len]
-        freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]
+        freqs_complex = self.freqs_complex[start_pos:start_pos
+                                           + seq_len
+                                           * (self.tp_world if self.use_sp else 1)]
         
         # Consecutively apply all the encoder layers
         for layer_id in range(self.layers_start, self.layers_end):
