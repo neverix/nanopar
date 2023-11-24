@@ -137,7 +137,8 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 class SelfAttention(nn.Module):
     def __init__(self, args: ModelArgs, dtype: torch.dtype, use_sdp: bool = True):
         super().__init__()
-
+        
+        self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
         # Indicates the number of heads for the Keys and Values
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         # Indicates the number of heads for the Queries
@@ -175,11 +176,11 @@ class SelfAttention(nn.Module):
         xv = self.wv(x)
 
         # (B, Seq_Len, H_Q * Head_Dim) -> (B, Seq_Len, H_Q, Head_Dim)
-        xq = xq.view(batch_size, seq_len, self.n_heads_q, self.head_dim)
+        xq = xq.view(batch_size, seq_len, self.n_heads_q // self.tp_size, self.head_dim)
         # (B, Seq_Len, H_KV * Head_Dim) -> (B, Seq_Len, H_KV, Head_Dim)
-        xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        xk = xk.view(batch_size, seq_len, self.n_kv_heads // self.tp_size, self.head_dim)
         # (B, Seq_Len, H_KV * Head_Dim) -> (B, Seq_Len, H_KV, Head_Dim)
-        xv = xv.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        xv = xv.view(batch_size, seq_len, self.n_kv_heads // self.tp_size, self.head_dim)
 
         # (B, Seq_Len, H_Q, Head_Dim) --> (B, Seq_Len, H_Q, Head_Dim)
         xq = apply_rotary_embeddings(xq, freqs_complex, device=x.device)
@@ -218,7 +219,10 @@ class SelfAttention(nn.Module):
             # (B, H_Q, Seq_Len, Seq_Len_KV) @ (B, H_Q, Seq_Len_KV, Head_Dim) -> (B, H_Q, Seq_Len, Head_Dim)
             output = torch.matmul(scores, values)
         else:
-            output = F.scaled_dot_product_attention(xq, keys, values, is_causal=True)
+            with torch.backends.cuda.sdp_kernel(
+                enable_math=False, enable_flash=True, enable_mem_efficient=False
+            ):
+                output = F.scaled_dot_product_attention(xq, keys, values, is_causal=True)
         # (B, H_Q, Seq_Len, Head_Dim) -> (B, Seq_Len, H_Q, Head_Dim) -> (B, Seq_Len, Dim)
         output = (output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1))
         return self.wo(output) # (B, Seq_Len, Dim) -> (B, Seq_Len, Dim)
