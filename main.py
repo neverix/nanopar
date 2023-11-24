@@ -6,8 +6,11 @@ from apex.optimizers.fused_adam import FusedAdam
 
 from model import ModelArgs, Transformer, PipelineStage
 
+from sentencepiece import SentencePieceProcessor
+import pandas as pd
 from pathlib import Path
 import argparse
+import random
 import torch
 import json
 import os
@@ -32,6 +35,7 @@ def set_random_seed(seed: int):
 def loss_fn(pred, label):
     loss = tensor_parallel.vocab_parallel_cross_entropy(pred, label)
     loss = loss.sum()
+    print(loss.item() / label.numel())
     # loss = average_losses_across_data_parallel_group([loss])
     return loss, {}
     
@@ -124,6 +128,13 @@ def main(llama_path=Path("llama-2-7b")):
     state_dict = {k: convert_weight_for_tp(v, k) for k, v in state_dict.items()}
     models[0].load_state_dict(state_dict)
     del state_dict
+
+    tokenizer = SentencePieceProcessor("llama-2-7b/tokenizer.model")
+    pile = pd.read_parquet("pile.parquet")
+    train_ds_size = 12
+    tokens = []
+    for i in range(train_ds_size):
+        tokens.extend(tokenizer.Encode(pile.iloc[i, 0]))
     
     lr = 1e-4
     weight_decay = 1e-5
@@ -140,7 +151,14 @@ def main(llama_path=Path("llama-2-7b")):
     )
     
     seq_len = 129  # llama_args.max_seq_len
-    batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
+    # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
+    batch_size = global_batch_size // data_parallel_size
+    data = []
+    for _ in range(batch_size):
+        offset = random.randrange(0, len(tokens) - seq_len)
+        data.append(tokens[offset:offset+seq_len])
+    batch = torch.LongTensor(data).cuda()
+    
     optimizer.zero_grad()
     loss = forward_backward_func(
         train_step,
