@@ -8,6 +8,7 @@ from model import ModelArgs, Transformer, PipelineStage
 
 from sentencepiece import SentencePieceProcessor
 import pandas as pd
+from tqdm import trange
 from pathlib import Path
 import argparse
 import random
@@ -46,6 +47,18 @@ def train_step(batch, model):
     return out, lambda pred: loss_fn(pred, label)
 
 
+def inference_step(batch, model):
+    tokens, *kv_cache = batch
+    out = model(tokens[:, -1:], start_pos=0, kv_cache=kv_cache)
+    return (out, *kv_cache), (lambda pred: (0, {"pred": pred}))
+
+
+def inference_step_dumb(batch, model):
+    tokens = batch
+    out = model(tokens, start_pos=0, kv_cache=None)
+    return out, (lambda pred: (0, {"pred": pred}))
+
+
 def convert_weight_for_tp(weight, key):
     if key.endswith("w2.weight") or key.endswith("wo.weight"):
         # row parallel
@@ -75,8 +88,8 @@ def main(llama_path=Path("llama-2-7b")):
     world_size = torch.distributed.get_world_size()
     print("Rank:", rank, "World:", world_size)
     
-    tensor_model_parallel_size = 2
-    pipeline_model_parallel_size = 1
+    tensor_model_parallel_size = 1
+    pipeline_model_parallel_size = 2
     virtual_pipeline_model_parallel_size = None
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size,
@@ -102,7 +115,7 @@ def main(llama_path=Path("llama-2-7b")):
     forward_backward_func = get_forward_backward_func(
         virtual_pipeline_model_parallel_size, pipeline_model_parallel_size)
     wrap_with_ddp = True
-    use_sp = True
+    use_sp = False
     set_random_seed(12)
     models = build_model(lambda args, **kwargs:
                          PipelineStage(Transformer(args,
@@ -136,6 +149,51 @@ def main(llama_path=Path("llama-2-7b")):
     for i in range(train_ds_size):
         tokens.extend(tokenizer.Encode(pile.iloc[i, 0]))
     
+    seq_len = 129  # llama_args.max_seq_len
+    # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
+    batch_size = global_batch_size // data_parallel_size
+    data = []
+    for _ in range(batch_size):
+        offset = random.randrange(0, len(tokens) - seq_len)
+        data.append(tokens[offset:offset+seq_len])
+    batch = torch.LongTensor(data).cuda()
+
+    kv_cache = tuple()
+    batch = batch[:, :-1]    
+    src = parallel_state.get_pipeline_model_parallel_last_rank()
+    group = parallel_state.get_embedding_group()
+    for i in (trange if local_rank == 0 else range)(8, batch.shape[1] - 1):
+        logits = forward_backward_func(
+            inference_step_dumb,
+            batch,
+            models,
+            forward_only=True,
+            # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
+            tensor_shape=(seq_len - 1, micro_batch_size, llama_args.dim),
+            # T4 doesn't have bfloat16
+            dtype=torch.float16,
+            async_comm=True,
+            sync_batch_comm=False,
+            sequence_parallel_enabled=use_sp,
+        )
+        if parallel_state.is_pipeline_last_stage():
+            logits = torch.cat([o["pred"] for o in logits], dim=1).float()
+            logits = logits.transpose(0, 1).contiguous()
+            logits = tensor_parallel.gather_from_tensor_model_parallel_region(
+                logits
+            )
+
+            # vocab is padded to maximize performance
+            logits = logits[:, :, :vocab_size]
+            batch[:, i + 1] = logits[:, i].argmax()
+            torch.distributed.broadcast(batch, src, group)
+        elif parallel_state.is_pipeline_first_stage():
+            torch.distributed.broadcast(batch, src, group)
+    if local_rank == 0:
+        for i, b in enumerate(batch):
+            print(f"Decoded {i}:", tokenizer.Decode(batch.cpu().numpy().tolist()))
+    return
+
     lr = 1e-4
     weight_decay = 1e-5
     optimizer = DistributedFusedAdam(
@@ -149,15 +207,6 @@ def main(llama_path=Path("llama-2-7b")):
         # redundant_process_group=parallel_state.get_data_parallel_group(),
         store_params=False,
     )
-    
-    seq_len = 129  # llama_args.max_seq_len
-    # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
-    batch_size = global_batch_size // data_parallel_size
-    data = []
-    for _ in range(batch_size):
-        offset = random.randrange(0, len(tokens) - seq_len)
-        data.append(tokens[offset:offset+seq_len])
-    batch = torch.LongTensor(data).cuda()
     
     optimizer.zero_grad()
     loss = forward_backward_func(

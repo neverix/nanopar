@@ -2,7 +2,7 @@ from apex.normalization import FusedRMSNorm
 from apex.transformer import tensor_parallel
 from apex.transformer import parallel_state
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Dict
 import math
 import torch
 import torch.nn as nn
@@ -160,7 +160,8 @@ class SelfAttention(nn.Module):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_complex: torch.Tensor
+        freqs_complex: torch.Tensor,
+        kv_cache: Optional[Dict[str, torch.Tensor]] = None
     ):
         # TODO fix this
         seq_len, batch_size, _ = x.shape  # (B, Seq_Len, Dim)
@@ -186,10 +187,28 @@ class SelfAttention(nn.Module):
         # (B, Seq_Len, H_KV, Head_Dim) --> (B, Seq_Len, H_KV, Head_Dim)
         xk = apply_rotary_embeddings(xk, freqs_complex, device=x.device)
 
-        # (B, Seq_Len_KV, H_KV, Head_Dim)
-        keys = xk
-        # (B, Seq_Len_KV, H_KV, Head_Dim)
-        values = xv
+        if kv_cache is None:
+            # (B, Seq_Len_KV, H_KV, Head_Dim)
+            keys = xk
+            # (B, Seq_Len_KV, H_KV, Head_Dim)
+            values = xv
+        else:
+            if len(kv_cache) == 0:
+                # (B, Seq_Len_KV)
+                index = torch.zeros((batch_size, self.n_heads_q // self.tp_size, seq_len),
+                                                 dtype=torch.long, device=x.device)
+                # (B, Seq_Len_KV, H_KV, Head_Dim)
+                # (B, Seq_Len_KV, H_KV, Head_Dim)
+                # (B, Seq_Len_KV)
+                kv_cache = (xk, xv, index)
+                keys, values = xk, xv
+            else:
+                index = kv_cache[2]
+                index += 1
+                keys = kv_cache[0]
+                keys.scatter_(1, index[:, :, None, None], xk)
+                values = kv_cache[1]
+                values.scatter_(1, index[:, :, None, None], xv)
 
         # Since every group of Q shares the same K and V heads, just repeat the K and V heads for every Q in the same group.
 
@@ -205,12 +224,13 @@ class SelfAttention(nn.Module):
         # (B, Seq_Len_KV, H_Q, Head_Dim) -> (B, H_Q, Seq_Len_KV, Head_Dim)
         values = values.transpose(1, 2)
 
-        if not self.use_sdp:
-            raise NotImplementedError("Stop using vanilla attention. Get some help.")
+        if (not self.use_sdp) or kv_cache is not None:
+            if not self.use_sdp:
+                raise NotImplementedError("Stop using vanilla attention. Get some help.")
             
             # (B, H_Q, Seq_Len, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len_KV) -> (B, H_Q, Seq_Len, Seq_Len_KV)
             scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-            scores = scores - (torch.arange(scores.shape[-2]).unsqueeze(-1).to(scores)
+            scores = scores - (index.unsqueeze(-1).to(scores)
                                >= torch.arange(scores.shape[-1]).unsqueeze(-2).to(scores)) * torch.inf
             # (B, H_Q, Seq_Len, Seq_Len_KV) -> (B, H_Q, Seq_Len, Seq_Len_KV)
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
@@ -280,10 +300,12 @@ class EncoderBlock(nn.Module):
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps,
                                 dtype=dtype, use_sp=use_sp)
     
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor,
+                kv_cache: Optional[Dict[str, torch.Tensor]] = None):
         # (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
         attn_out = self.attention(
-            self.attention_norm(x), start_pos, freqs_complex
+            self.attention_norm(x), start_pos, freqs_complex,
+            kv_cache=kv_cache
         )
         # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
         h = x + attn_out
@@ -331,7 +353,7 @@ class Transformer(nn.Module):
                                                               * (self.tp_world if use_sp else 1),
                                                               device=self.args.device)
 
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, start_pos: int, kv_cache: Optional[Dict[str, Dict[str, torch.Tensor]]] = None):
         if self.pp_rank == 0:
             # (B, Seq_Len) -> (B, Seq_Len, Dim)
             h = self.tok_embeddings(tokens)
@@ -352,8 +374,16 @@ class Transformer(nn.Module):
         
         # Consecutively apply all the encoder layers
         for layer_id in range(self.layers_start, self.layers_end):
-            layer = self.layers[str(layer_id)]
-            h = layer(h, start_pos, freqs_complex)
+            if kv_cache is None:
+                cache = None
+            else:
+                i = layer_id - self.layers_start
+                kv_cache = kv_cache + [tuple()]
+                cache = kv_cache[i]
+            layer_id = str(layer_id)
+            layer = self.layers[layer_id]
+            h = layer(h, start_pos, freqs_complex,
+                      kv_cache=cache)
         if self.pp_rank == self.pp_world - 1:
             h = self.norm(h)
             output = self.output(h).float()
