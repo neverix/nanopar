@@ -14,6 +14,7 @@ import argparse
 import random
 import torch
 import json
+import fire
 import os
 
 
@@ -77,7 +78,9 @@ def convert_weight_for_tp(weight, key):
     ].transpose(0, dim)
 
 
-def main(llama_path=Path("llama-2-7b")):
+def main(
+    llama_path=Path("llama-2-7b"),
+    test_inference=False):
     rank = int(os.environ["RANK"])
     gpus_per_node = torch.cuda.device_count()  # TODO
     
@@ -158,41 +161,41 @@ def main(llama_path=Path("llama-2-7b")):
         data.append(tokens[offset:offset+seq_len])
     batch = torch.LongTensor(data).cuda()
 
-    kv_cache = tuple()
-    batch = batch[:, :-1]    
-    src = parallel_state.get_pipeline_model_parallel_last_rank()
-    group = parallel_state.get_embedding_group()
-    for i in (trange if local_rank == 0 else range)(8, batch.shape[1] - 1):
-        logits = forward_backward_func(
-            inference_step_dumb,
-            batch,
-            models,
-            forward_only=True,
-            # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
-            tensor_shape=(seq_len - 1, micro_batch_size, llama_args.dim),
-            # T4 doesn't have bfloat16
-            dtype=torch.float16,
-            async_comm=True,
-            sync_batch_comm=False,
-            sequence_parallel_enabled=use_sp,
-        )
-        if parallel_state.is_pipeline_last_stage():
-            logits = torch.cat([o["pred"] for o in logits], dim=1).float()
-            logits = logits.transpose(0, 1).contiguous()
-            logits = tensor_parallel.gather_from_tensor_model_parallel_region(
-                logits
+    if test_inference:
+        batch = batch[:, :-1]    
+        src = parallel_state.get_pipeline_model_parallel_last_rank()
+        group = parallel_state.get_embedding_group()
+        for i in (trange if local_rank == 0 else range)(8, batch.shape[1] - 1):
+            logits = forward_backward_func(
+                inference_step_dumb,
+                batch,
+                models,
+                forward_only=True,
+                # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
+                tensor_shape=(seq_len - 1, micro_batch_size, llama_args.dim),
+                # T4 doesn't have bfloat16
+                dtype=torch.float16,
+                async_comm=True,
+                sync_batch_comm=False,
+                sequence_parallel_enabled=use_sp,
             )
+            if parallel_state.is_pipeline_last_stage():
+                logits = torch.cat([o["pred"] for o in logits], dim=1).float()
+                logits = logits.transpose(0, 1).contiguous()
+                logits = tensor_parallel.gather_from_tensor_model_parallel_region(
+                    logits
+                )
 
-            # vocab is padded to maximize performance
-            logits = logits[:, :, :vocab_size]
-            batch[:, i + 1] = logits[:, i].argmax()
-            torch.distributed.broadcast(batch, src, group)
-        elif parallel_state.is_pipeline_first_stage():
-            torch.distributed.broadcast(batch, src, group)
-    if local_rank == 0:
-        for i, b in enumerate(batch):
-            print(f"Decoded {i}:", tokenizer.Decode(batch.cpu().numpy().tolist()))
-    return
+                # vocab is padded to maximize performance
+                logits = logits[:, :, :vocab_size]
+                batch[:, i + 1] = logits[:, i].argmax()
+                torch.distributed.broadcast(batch, src, group)
+            elif parallel_state.is_pipeline_first_stage():
+                torch.distributed.broadcast(batch, src, group)
+        if local_rank == 0:
+            for i, b in enumerate(batch):
+                print(f"Decoded {i}:", tokenizer.Decode(batch.cpu().numpy().tolist()))
+        return
 
     lr = 1e-4
     weight_decay = 1e-5
@@ -227,4 +230,4 @@ def main(llama_path=Path("llama-2-7b")):
 
 
 if __name__ == "__main__":
-    main()
+    fire.Fire(main)
