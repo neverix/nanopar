@@ -7,14 +7,15 @@ from apex.optimizers.fused_adam import FusedAdam
 from model import ModelArgs, Transformer, PipelineStage
 
 from sentencepiece import SentencePieceProcessor
+from streaming import StreamingDataset, MDSWriter
 import pandas as pd
 from tqdm import trange
 from pathlib import Path
+import numpy as np
 import argparse
 import random
 import torch
 import json
-import fire
 import os
 
 
@@ -80,7 +81,8 @@ def convert_weight_for_tp(weight, key):
 
 def main(
     llama_path=Path("llama-2-7b"),
-    test_inference=False):
+    test_inference=False,
+    data_dir: str = "data"):
     rank = int(os.environ["RANK"])
     gpus_per_node = torch.cuda.device_count()  # TODO
     
@@ -145,24 +147,30 @@ def main(
     models[0].load_state_dict(state_dict)
     del state_dict
 
-    tokenizer = SentencePieceProcessor("llama-2-7b/tokenizer.model")
-    pile = pd.read_parquet("pile.parquet")
-    train_ds_size = 12
-    tokens = []
-    for i in range(train_ds_size):
-        tokens.extend(tokenizer.Encode(pile.iloc[i, 0]))
-    
+
     seq_len = 129  # llama_args.max_seq_len
     # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
     batch_size = global_batch_size // data_parallel_size
-    data = []
-    for _ in range(batch_size):
-        offset = random.randrange(0, len(tokens) - seq_len)
-        data.append(tokens[offset:offset+seq_len])
-    batch = torch.LongTensor(data).cuda()
+    if local_rank == 0:
+        tokenizer = SentencePieceProcessor("llama-2-7b/tokenizer.model")
+        pile = pd.read_parquet("pile.parquet")
+        train_ds_size = 12
+        tokens = []
+        for i in range(train_ds_size):
+            tokens.extend(tokenizer.Encode(pile.iloc[i, 0]))
+        tokens = np.asarray(tokens, dtype=np.int32)
+        if not os.path.exists(data_dir):
+            with MDSWriter(out=data_dir, columns={"tokens": "ndarray"}, compression="zstd") as out:
+                for _ in trange(1_000):
+                    offset = random.randrange(0, len(tokens) - seq_len)
+                    sample = {
+                        "tokens": tokens[offset:offset+seq_len]
+                    }
+                    out.write(sample)
 
     if test_inference:
-        batch = batch[:, :-1]    
+        raise NotImplementedError()
+        batch = batch[:, :-1]
         src = parallel_state.get_pipeline_model_parallel_last_rank()
         group = parallel_state.get_embedding_group()
         for i in (trange if local_rank == 0 else range)(8, batch.shape[1] - 1):
@@ -211,23 +219,27 @@ def main(
         store_params=False,
     )
     
-    optimizer.zero_grad()
-    loss = forward_backward_func(
-        train_step,
-        batch,
-        models,
-        forward_only=False,
-        # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
-        tensor_shape=(seq_len - 1, micro_batch_size, llama_args.dim),
-        # T4 doesn't have bfloat16
-        dtype=torch.float16,
-        async_comm=True,
-        sync_batch_comm=False,
-        sequence_parallel_enabled=use_sp,
-    )
-    optimizer.step()
-    torch.distributed.barrier()
+    dataset = StreamingDataset(local="local", remote=data_dir, shuffle=True)
+    dl = torch.utils.data.DataLoader(dataset, shuffle=False, batch_size=batch_size)
+    for sample in dl:
+        batch = sample["tokens"].long().cuda()
+        optimizer.zero_grad()
+        loss = forward_backward_func(
+            train_step,
+            batch,
+            models,
+            forward_only=False,
+            # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
+            tensor_shape=(seq_len - 1, micro_batch_size, llama_args.dim),
+            # T4 doesn't have bfloat16
+            dtype=torch.float16,
+            async_comm=True,
+            sync_batch_comm=False,
+            sequence_parallel_enabled=use_sp,
+        )
+        optimizer.step()
+        torch.distributed.barrier()
 
 
 if __name__ == "__main__":
-    fire.Fire(main)
+    main()
