@@ -163,3 +163,12 @@ cython_debug/
 llama-2-*
 tokenizer.model
 sampling_tests.ipynb
+
+# Ignore data
+data/
+local/
+pile.parquet
+hh-rlhf/
+
+# Ignore code
+apex/

@@ -8,14 +8,15 @@ from model import ModelArgs, Transformer, PipelineStage
 
 from sentencepiece import SentencePieceProcessor
 from streaming import StreamingDataset, MDSWriter
-import pandas as pd
 from tqdm import trange
 from pathlib import Path
+import pandas as pd
 import numpy as np
-import argparse
 import random
 import torch
 import json
+import gzip
+import fire
 import os
 
 
@@ -36,23 +37,25 @@ def set_random_seed(seed: int):
 
 
 def loss_fn(pred, label):
-    loss = tensor_parallel.vocab_parallel_cross_entropy(pred, label)
+    losses = tensor_parallel.vocab_parallel_cross_entropy(pred, label)
+    losses_chosen, losses_rejected = losses.chunk(losses, 2)
+    loss = losses_chosen
     loss = loss.sum()
-    print(loss.item() / label.numel())
     # loss = average_losses_across_data_parallel_group([loss])
     return loss, {}
     
     
 def train_step(batch, model):
-    out = model(batch[:, :-1], start_pos=0)
+    out = model(
+        batch.transpose(0, 1).reshape(-1, batch.shape[-1])[:, :-1], start_pos=0)
     label = batch[:, 1:].transpose(0, 1)
     return out, lambda pred: loss_fn(pred, label)
 
 
-def inference_step(batch, model):
-    tokens, *kv_cache = batch
-    out = model(tokens[:, -1:], start_pos=0, kv_cache=kv_cache)
-    return (out, *kv_cache), (lambda pred: (0, {"pred": pred}))
+# def inference_step(batch, model):
+#     tokens, *kv_cache = batch
+#     out = model(tokens[:, -1:], start_pos=0, kv_cache=kv_cache)
+#     return (out, *kv_cache), (lambda pred: (0, {"pred": pred}))
 
 
 def inference_step_dumb(batch, model):
@@ -82,7 +85,9 @@ def convert_weight_for_tp(weight, key):
 def main(
     llama_path=Path("llama-2-7b"),
     test_inference=False,
-    data_dir: str = "data"):
+    data_dir=Path("data"),
+    tensor_model_parallel_size = 1,
+    pipeline_model_parallel_size = 1):
     rank = int(os.environ["RANK"])
     gpus_per_node = torch.cuda.device_count()  # TODO
     
@@ -93,8 +98,6 @@ def main(
     world_size = torch.distributed.get_world_size()
     print("Rank:", rank, "World:", world_size)
     
-    tensor_model_parallel_size = 1
-    pipeline_model_parallel_size = 2
     virtual_pipeline_model_parallel_size = None
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size,
@@ -148,29 +151,54 @@ def main(
     del state_dict
 
 
-    seq_len = 129  # llama_args.max_seq_len
+    seq_len = 128  # llama_args.max_seq_len
     # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
     batch_size = global_batch_size // data_parallel_size
     if local_rank == 0:
         tokenizer = SentencePieceProcessor("llama-2-7b/tokenizer.model")
-        pile = pd.read_parquet("pile.parquet")
-        train_ds_size = 12
-        tokens = []
-        for i in range(train_ds_size):
-            tokens.extend(tokenizer.Encode(pile.iloc[i, 0]))
-        tokens = np.asarray(tokens, dtype=np.int32)
-        if not os.path.exists(data_dir):
-            with MDSWriter(out=data_dir, columns={"tokens": "ndarray"}, compression="zstd") as out:
-                for _ in trange(1_000):
-                    offset = random.randrange(0, len(tokens) - seq_len)
-                    sample = {
-                        "tokens": tokens[offset:offset+seq_len]
-                    }
-                    out.write(sample)
 
+        train_ds_size = 12
+        # pile = pd.read_parquet("pile.parquet")
+        # tokens = []
+        # for i in range(train_ds_size):
+        #     tokens.extend(tokenizer.Encode(pile.iloc[i, 0]))
+        # tokens = np.asarray(tokens, dtype=np.int32)
+        # if not os.path.exists(data_dir):
+        #     with MDSWriter(out=data_dir, columns={"tokens": "ndarray"}, compression="zstd") as out:
+        #         for _ in trange(1_000):
+        #             offset = random.randrange(0, len(tokens) - seq_len)
+        #             sample = {
+        #                 "tokens": tokens[offset:offset+seq_len]
+        #             }
+        #             out.write(sample)
+        
+        hh = gzip.open("hh-rlhf/helpful-base/train.jsonl.gz", mode="rt")
+        samples = []
+        
+        def encode(text):
+            tokens = tokenizer.Encode(text)[-seq_len:]
+            tokens = np.asarray(tokens, dtype=np.int32)
+            tokens = np.pad(tokens, ((0, seq_len - len(tokens)),), constant_values=-100)
+            return tokens
+        
+        for i, sample in zip(range(train_ds_size), hh):
+            sample = json.loads(sample.strip())
+            samples.append((encode(sample["chosen"]), encode(sample["rejected"])))
+        if not os.path.exists(data_dir):
+            with MDSWriter(out=str(data_dir), columns={"tokens": "ndarray"}, compression="zstd") as out:
+                for chosen, rejected in samples:
+                    out.write({
+                        "tokens": np.stack((chosen, rejected), axis=0)
+                    })
+
+    dataset = StreamingDataset(local="local", remote=data_dir, shuffle=True)
+    dl = torch.utils.data.DataLoader(dataset, shuffle=False, batch_size=batch_size)
     if test_inference:
-        raise NotImplementedError()
-        batch = batch[:, :-1]
+        # raise NotImplementedError()
+        sample = next(iter(dl))
+        batch = sample["tokens"].long().cuda()
+        batch = batch.reshape(-1, batch.shape[-1])
+        # batch = batch[:, :-1]
         src = parallel_state.get_pipeline_model_parallel_last_rank()
         group = parallel_state.get_embedding_group()
         for i in (trange if local_rank == 0 else range)(8, batch.shape[1] - 1):
@@ -196,13 +224,13 @@ def main(
 
                 # vocab is padded to maximize performance
                 logits = logits[:, :, :vocab_size]
-                batch[:, i + 1] = logits[:, i].argmax()
+                batch[:, i + 1] = logits[:, i].argmax(-1)
                 torch.distributed.broadcast(batch, src, group)
             elif parallel_state.is_pipeline_first_stage():
                 torch.distributed.broadcast(batch, src, group)
-        if local_rank == 0:
-            for i, b in enumerate(batch):
-                print(f"Decoded {i}:", tokenizer.Decode(batch.cpu().numpy().tolist()))
+            if local_rank == 0:
+                for j, b in enumerate(batch):
+                    print(f"Step {i}, decoded {j}:", tokenizer.Decode(b[:i].cpu().numpy().tolist()))
         return
 
     lr = 1e-4
@@ -219,8 +247,6 @@ def main(
         store_params=False,
     )
     
-    dataset = StreamingDataset(local="local", remote=data_dir, shuffle=True)
-    dl = torch.utils.data.DataLoader(dataset, shuffle=False, batch_size=batch_size)
     for sample in dl:
         batch = sample["tokens"].long().cuda()
         optimizer.zero_grad()
@@ -242,4 +268,4 @@ def main(
 
 
 if __name__ == "__main__":
-    main()
+    fire.Fire(main)
