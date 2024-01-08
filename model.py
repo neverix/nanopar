@@ -353,7 +353,10 @@ class Transformer(nn.Module):
                                                               * (self.tp_world if use_sp else 1),
                                                               device=self.args.device)
 
-    def forward(self, tokens: torch.Tensor, start_pos: int, kv_cache: Optional[Dict[str, Dict[str, torch.Tensor]]] = None):
+    def forward(self,
+                tokens: torch.Tensor,
+                start_pos: int = 0,
+                kv_cache: Optional[Dict[str, Dict[str, torch.Tensor]]] = None):
         if self.pp_rank == 0:
             # (B, Seq_Len) -> (B, Seq_Len, Dim)
             h = self.tok_embeddings(tokens)
