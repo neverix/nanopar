@@ -52,6 +52,7 @@ def main_with_model(main_fn):
              pipeline_model_parallel_size = 1,
              virtual_pipeline_model_parallel_size: Optional[int] = None,
              use_sp=False,
+             wrap_with_ddp=False,
              seed: Optional[int] = None,
              **kwargs):
         rank = int(os.environ["RANK"])
@@ -87,18 +88,18 @@ def main_with_model(main_fn):
         
         forward_backward_func = get_forward_backward_func(
             virtual_pipeline_model_parallel_size, pipeline_model_parallel_size)
-        wrap_with_ddp = True
         if seed is None:
             seed = random.randrange(0, 2 ^ 31)
         set_random_seed(seed)
     
         models = build_model(lambda args, **_:
                         PipelineStage(Transformer(args,
-                                                dtype=torch.float16,
+                                                dtype=torch.bfloat16,
                                                 use_sp=use_sp)),
                     wrap_with_ddp,
                     virtual_pipeline_model_parallel_size,
                     args=llama_args)
+        torch.cuda.empty_cache()  # frees ~9GB
     
         main_fn(models, dict(
             rank=rank,
@@ -109,14 +110,15 @@ def main_with_model(main_fn):
             tp_rank=tp_rank,
             pp_rank=pp_rank,
             use_sp=use_sp,
+            wrap_with_ddp=wrap_with_ddp,
             forward_backward_func=forward_backward_func
             ), *args, **kwargs)
     return main
 
 
-def load_consolidated_weights(models, path: Path):
+def load_consolidated_weights(models, path: Path, wrap_with_ddp: bool):
     state_dict = torch.load(str(path), mmap=True)
-    state_dict = {"module.wrapped." + k: v for k, v in state_dict.items()}
+    state_dict = {f"{'module.' if wrap_with_ddp else ''}wrapped." + k: v for k, v in state_dict.items()}
     state_dict = {k: state_dict[k] for k in models[0].state_dict().keys()}
     state_dict = {k: convert_weight_for_tp(v, k) for k, v in state_dict.items()}
     models[0].load_state_dict(state_dict)

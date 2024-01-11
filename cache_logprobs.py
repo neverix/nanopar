@@ -32,9 +32,9 @@ def cache_logprob(batch, model):
 @torch.inference_mode()
 @main_with_model
 def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logprob")):
-    rank, data_parallel_size, llama_args, model_dir, use_sp, forward_backward_func = [
+    rank, data_parallel_size, llama_args, model_dir, use_sp, wrap_with_ddp, forward_backward_func = [
         kwargs[k] for k in
-        ["rank", "data_parallel_size", "llama_args", "model_dir", "use_sp", "forward_backward_func"]]
+        ["rank", "data_parallel_size", "llama_args", "model_dir", "use_sp", "wrap_with_ddp", "forward_backward_func"]]
     
     global_batch_size = 32
     micro_batch_size = 32
@@ -49,7 +49,7 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
         data_parallel_size=data_parallel_size,
     )
     
-    load_consolidated_weights(models, model_dir / "consolidated.00.pth")
+    load_consolidated_weights(models, model_dir / "consolidated.00.pth", wrap_with_ddp)
     
     # https://github.com/mosaicml/streaming/blob/release/v0.7.1/streaming/multimodal/convert/webvid/extract_webvid_videos.py
     # no special utility for processing StreamingDatasets

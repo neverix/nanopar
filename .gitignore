@@ -169,6 +169,7 @@ data/
 local/
 pile.parquet
 hh-rlhf/
+wandb/
 
 # Ignore code
 apex/

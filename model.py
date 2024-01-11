@@ -64,9 +64,9 @@ class RowParallelLinear(tensor_parallel.RowParallelLinear):
 
 class RMSNorm(FusedRMSNorm):
     def __init__(self, dim: int, eps: float = 1e-6,
-                 dtype: torch.dtype = torch.float32, use_sp: bool = False):
+                 dtype: torch.dtype = torch.bfloat16, use_sp: bool = False):
         super().__init__(dim, eps=eps)
-        self.weight.to(dtype)
+        self.weight.data = self.weight.data.to(dtype)
         if use_sp:
             self.weight.sequence_parallel_enabled = use_sp
 

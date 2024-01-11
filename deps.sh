@@ -7,4 +7,4 @@ fi
 cd apex
 git checkout 2386a912164b0c5cfcd8be7a2b890fbac5607c82
 python -m pip install --disable-pip-version-check --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" --config-settings "--build-option=--distributed_adam" --config-settings "--build-option=--deprecated_fused_adam" ./
-python -m pip install -q mosaicml-streaming sentencepiece pandas pyarrow fire
+python -m pip install -q mosaicml-streaming sentencepiece pandas pyarrow fire wandb

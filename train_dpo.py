@@ -8,6 +8,7 @@ from loading_utils import main_with_model, load_consolidated_weights
 from streaming import StreamingDataset
 from pathlib import Path
 from tqdm import tqdm
+import wandb
 import torch
 import fire
 
@@ -49,10 +50,10 @@ def inference_step_dumb(batch, model):
 
 
 @main_with_model
-def main(models, kwargs, data_dir=Path("data/logprob")):
-    rank, data_parallel_size, llama_args, model_dir, forward_backward_func, use_sp = [
+def main(models, kwargs, data_dir=Path("data/logprob"), grad_acc: int = 8):
+    rank, data_parallel_size, llama_args, model_dir, forward_backward_func, use_sp, wrap_with_ddp = [
         kwargs[k] for k in
-        ["rank", "data_parallel_size", "llama_args", "model_dir", "forward_backward_func", "use_sp"]]
+        ["rank", "data_parallel_size", "llama_args", "model_dir", "forward_backward_func", "use_sp", "wrap_with_ddp"]]
     
     global_batch_size = 1
     micro_batch_size = 1
@@ -65,17 +66,16 @@ def main(models, kwargs, data_dir=Path("data/logprob")):
         data_parallel_size=data_parallel_size,
     )
     
-    load_consolidated_weights(models, model_dir / "consolidated.00.pth")
+    load_consolidated_weights(models, model_dir / "consolidated.00.pth", wrap_with_ddp)
 
-    seq_len = llama_args.max_seq_len
     # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
     batch_size = global_batch_size // data_parallel_size
 
     dataset = StreamingDataset(local="local/dpo", remote=data_dir, shuffle=True)
     dl = torch.utils.data.DataLoader(dataset, shuffle=False, batch_size=batch_size)
 
-    lr = 1e-4
-    weight_decay = 1e-5
+    lr = 1e-5
+    weight_decay = 1e-6
     optimizer = DistributedFusedAdam(
         models[0].parameters(),
         lr=lr,
@@ -87,22 +87,35 @@ def main(models, kwargs, data_dir=Path("data/logprob")):
         # redundant_process_group=parallel_state.get_data_parallel_group(),
         store_params=False,
     )
+    optimizer.init_param_buffer()
     
-    for sample in tqdm(dl):
+    wandb.init(
+        mode="offline",
+        project="nanopar"
+    )
+
+    total_loss = 0
+    for i, sample in enumerate(bar := tqdm(dl)):
         torch.distributed.barrier()
-        optimizer.zero_grad()
         loss = forward_backward_func(
             train_step,
             sample,
             models,
             forward_only=False,
-            tensor_shape=(seq_len, micro_batch_size, llama_args.dim),
+            tensor_shape=(llama_args.max_seq_len, micro_batch_size, llama_args.dim),
             dtype=torch.bfloat16,
             async_comm=True,
             sync_batch_comm=False,
             sequence_parallel_enabled=use_sp,
-        )
-        optimizer.step()
+        )[0]["loss"]
+        total_loss += loss.item() / grad_acc
+        if i % grad_acc == grad_acc - 1:
+            torch.nn.utils.clip_grad_norm_(models[0].parameters(), 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            wandb.log(dict(loss=total_loss))
+            bar.set_postfix(loss=total_loss)
+            total_loss = 0
 
 
 if __name__ == "__main__":
