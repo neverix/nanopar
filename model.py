@@ -58,7 +58,7 @@ class RowParallelLinear(tensor_parallel.RowParallelLinear):
     
     def forward(self, x):
         # ignore bias
-        result, _ = super().forward(x)
+        result, _ = super().forward(x.contiguous())
         return result
 
 

@@ -1,4 +1,4 @@
-from apex.transformer.pipeline_parallel.utils import setup_microbatch_calculator
+from apex.transformer.pipeline_parallel.utils import setup_microbatch_calculator, average_losses_across_data_parallel_group
 from apex.transformer import parallel_state, tensor_parallel
 from apex.contrib.optimizers.distributed_fused_adam import DistributedFusedAdam
 # from apex.optimizers.fused_adam import FusedAdam
@@ -6,26 +6,34 @@ from apex.contrib.optimizers.distributed_fused_adam import DistributedFusedAdam
 from loading_utils import main_with_model, load_consolidated_weights
 
 from streaming import StreamingDataset
-from tqdm import trange
 from pathlib import Path
+from tqdm import tqdm
 import torch
 import fire
 
 
-def loss_fn(pred, label):
-    losses = tensor_parallel.vocab_parallel_cross_entropy(pred, label)
-    losses_chosen, losses_rejected = losses.chunk(losses, 2)
-    loss = losses_chosen
-    loss = loss.sum()
-    # loss = average_losses_across_data_parallel_group([loss])
-    return loss, {}
+def loss_fn(pred, label, logprobs, beta=0.1):
+    losses = tensor_parallel.vocab_parallel_cross_entropy(pred.contiguous(), label.contiguous())
+    mask = label >= 0
+    losses = (losses * mask).sum(0)
+    losses = losses.view(-1, 2).transpose(0, 1)
+    losses_chosen, losses_rejected = losses
+    logprobs_chosen, logprobs_rejected = logprobs.T
+    loss = -torch.nn.functional.logsigmoid(beta * ((losses_chosen - losses_rejected) - (logprobs_chosen - logprobs_rejected)))
+    loss = loss.mean()
+    return loss, {"loss": average_losses_across_data_parallel_group([loss])}
     
     
 def train_step(batch, model):
-    out = model(
-        batch.transpose(0, 1).reshape(-1, batch.shape[-1])[:, :-1], start_pos=0)
-    label = batch[:, 1:].transpose(0, 1)
-    return out, lambda pred: loss_fn(pred, label)
+    tokens, logprobs = batch["tokens"], batch["logprobs"]
+    tokens = tokens.long().cuda()
+    logprobs = logprobs.cuda()
+    inputs = tokens.reshape(-1, tokens.shape[-1])[:, :-1].contiguous()
+    inputs[inputs < 0] = 0
+    out = model(inputs.contiguous()).contiguous()
+    label = tokens[..., 1:]
+    label = label.view(-1, label.shape[-1]).transpose(0, 1)
+    return out, lambda pred: loss_fn(pred, label, logprobs)
 
 
 # def inference_step(batch, model):
@@ -41,10 +49,10 @@ def inference_step_dumb(batch, model):
 
 
 @main_with_model
-def main(models, kwargs, data_dir=Path("data")):
-    rank, local_rank, data_parallel_size, llama_args, model_dir = [
+def main(models, kwargs, data_dir=Path("data/logprob")):
+    rank, data_parallel_size, llama_args, model_dir, forward_backward_func, use_sp = [
         kwargs[k] for k in
-        ["rank", "local_rank", "data_parallel_size", "llama_args", "model_dir"]]
+        ["rank", "data_parallel_size", "llama_args", "model_dir", "forward_backward_func", "use_sp"]]
     
     global_batch_size = 1
     micro_batch_size = 1
@@ -59,51 +67,12 @@ def main(models, kwargs, data_dir=Path("data")):
     
     load_consolidated_weights(models, model_dir / "consolidated.00.pth")
 
-    seq_len = 128  # llama_args.max_seq_len
+    seq_len = llama_args.max_seq_len
     # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
     batch_size = global_batch_size // data_parallel_size
 
-    dataset = StreamingDataset(local="local", remote=data_dir, shuffle=True)
+    dataset = StreamingDataset(local="local/dpo", remote=data_dir, shuffle=True)
     dl = torch.utils.data.DataLoader(dataset, shuffle=False, batch_size=batch_size)
-    if test_inference:
-        # raise NotImplementedError()
-        sample = next(iter(dl))
-        batch = sample["tokens"].long().cuda()
-        batch = batch.reshape(-1, batch.shape[-1])
-        # batch = batch[:, :-1]
-        src = parallel_state.get_pipeline_model_parallel_last_rank()
-        group = parallel_state.get_embedding_group()
-        for i in (trange if local_rank == 0 else range)(8, batch.shape[1] - 1):
-            logits = forward_backward_func(
-                inference_step_dumb,
-                batch,
-                models,
-                forward_only=True,
-                # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
-                tensor_shape=(seq_len - 1, micro_batch_size, llama_args.dim),
-                # T4 doesn't have bfloat16
-                dtype=torch.float16,
-                async_comm=True,
-                sync_batch_comm=False,
-                sequence_parallel_enabled=use_sp,
-            )
-            if parallel_state.is_pipeline_last_stage():
-                logits = torch.cat([o["pred"] for o in logits], dim=1).float()
-                logits = logits.transpose(0, 1).contiguous()
-                logits = tensor_parallel.gather_from_tensor_model_parallel_region(
-                    logits
-                )
-
-                # vocab is padded to maximize performance
-                logits = logits[:, :, :vocab_size]
-                batch[:, i + 1] = logits[:, i].argmax(-1)
-                torch.distributed.broadcast(batch, src, group)
-            elif parallel_state.is_pipeline_first_stage():
-                torch.distributed.broadcast(batch, src, group)
-            if local_rank == 0:
-                for j, b in enumerate(batch):
-                    print(f"Step {i}, decoded {j}:", tokenizer.Decode(b[:i].cpu().numpy().tolist()))
-        return
 
     lr = 1e-4
     weight_decay = 1e-5
@@ -119,24 +88,21 @@ def main(models, kwargs, data_dir=Path("data")):
         store_params=False,
     )
     
-    for sample in dl:
-        batch = sample["tokens"].long().cuda()
+    for sample in tqdm(dl):
+        torch.distributed.barrier()
         optimizer.zero_grad()
         loss = forward_backward_func(
             train_step,
-            batch,
+            sample,
             models,
             forward_only=False,
-            # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
-            tensor_shape=(seq_len - 1, micro_batch_size, llama_args.dim),
-            # T4 doesn't have bfloat16
-            dtype=torch.float16,
+            tensor_shape=(seq_len, micro_batch_size, llama_args.dim),
+            dtype=torch.bfloat16,
             async_comm=True,
             sync_batch_comm=False,
             sequence_parallel_enabled=use_sp,
         )
         optimizer.step()
-        torch.distributed.barrier()
 
 
 if __name__ == "__main__":

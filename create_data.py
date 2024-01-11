@@ -16,9 +16,9 @@ import os
 def main(
     model_dir = Path("llama-2-7b"),
     train_ds_size = 1024,
-    seq_len = 2048,
+    seq_len = 2049,
     use_pile=False,
-    data_dir=Path("data")):
+    data_dir=Path("data/orig")):
     tokenizer = SentencePieceProcessor(str(model_dir / "tokenizer.model"))
 
     if use_pile:
@@ -48,6 +48,7 @@ def main(
             sample = json.loads(sample.strip())
             samples.append((encode(sample["chosen"]), encode(sample["rejected"])))
         if not os.path.exists(data_dir):
+            os.makedirs(data_dir, exist_ok=True)
             with MDSWriter(out=str(data_dir), columns={"tokens": "ndarray"}, compression="zstd") as out:
                 for chosen, rejected in samples:
                     out.write({
