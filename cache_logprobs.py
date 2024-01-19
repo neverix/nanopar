@@ -1,4 +1,5 @@
 from loading_utils import main_with_model, load_consolidated_weights
+from models.llama import Transformer, PipelineStage
 
 from apex.transformer.pipeline_parallel.utils import setup_microbatch_calculator
 from apex.transformer import tensor_parallel
@@ -30,7 +31,10 @@ def cache_logprob(batch, model):
 
 
 @torch.inference_mode()
-@main_with_model
+@main_with_model(lambda args, **_:
+                        PipelineStage(Transformer(args,
+                                                dtype=torch.bfloat16,
+                                                use_sp=args.use_sp)))
 def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logprob")):
     rank, data_parallel_size, llama_args, model_dir, use_sp, wrap_with_ddp, forward_backward_func = [
         kwargs[k] for k in

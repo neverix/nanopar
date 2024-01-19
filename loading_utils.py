@@ -1,4 +1,4 @@
-from model import ModelArgs, Transformer, PipelineStage
+from models.llama import ModelArgs
 
 from apex.transformer.pipeline_parallel import get_forward_backward_func, build_model
 from apex.transformer import parallel_state, tensor_parallel
@@ -45,75 +45,75 @@ def convert_weight_for_tp(weight, key):
     ].transpose(0, dim)
 
 
-def main_with_model(main_fn):
-    def main(*args,
-             model_dir=Path("llama-2-7b"),
-             tensor_model_parallel_size = 1,
-             pipeline_model_parallel_size = 1,
-             virtual_pipeline_model_parallel_size: Optional[int] = None,
-             use_sp=False,
-             wrap_with_ddp=False,
-             seed: Optional[int] = None,
-             **kwargs):
-        rank = int(os.environ["RANK"])
-        gpus_per_node = torch.cuda.device_count()  # TODO
-    
-        torch.distributed.init_process_group(backend="nccl",
-                                            rank=rank)
-        local_rank = rank % gpus_per_node
-        torch.cuda.set_device(local_rank)
-        world_size = torch.distributed.get_world_size()
-        print("Rank:", rank, "World:", world_size)
+def main_with_model(model_provider):
+    def decorator(main_fn):
+        def main(*args,
+                model_dir=Path("llama-2-7b"),
+                tensor_model_parallel_size = 1,
+                pipeline_model_parallel_size = 1,
+                virtual_pipeline_model_parallel_size: Optional[int] = None,
+                use_sp=False,
+                wrap_with_ddp=False,
+                seed: Optional[int] = None,
+                **kwargs):
+            rank = int(os.environ["RANK"])
+            gpus_per_node = torch.cuda.device_count()  # TODO
         
-        parallel_state.initialize_model_parallel(
-            tensor_model_parallel_size,
-            pipeline_model_parallel_size,
-            virtual_pipeline_model_parallel_size
-        )
+            torch.distributed.init_process_group(backend="nccl",
+                                                rank=rank)
+            local_rank = rank % gpus_per_node
+            torch.cuda.set_device(local_rank)
+            world_size = torch.distributed.get_world_size()
+            print("Rank:", rank, "World:", world_size)
+            
+            parallel_state.initialize_model_parallel(
+                tensor_model_parallel_size,
+                pipeline_model_parallel_size,
+                virtual_pipeline_model_parallel_size
+            )
+            
+            data_parallel_size = (
+                world_size // (tensor_model_parallel_size * pipeline_model_parallel_size))
+            
+            vocab_size = 32_000
+            loaded_args = json.load(open(model_dir / "params.json", "r"))
+            loaded_args["vocab_size"] = vocab_size
+            llama_args = ModelArgs(
+                **loaded_args,
+                device="cuda"
+            )
+            
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            torch.backends.cudnn.benchmark = True
+            
+            forward_backward_func = get_forward_backward_func(
+                virtual_pipeline_model_parallel_size, pipeline_model_parallel_size)
+            if seed is None:
+                seed = random.randrange(0, 2 ^ 31)
+            set_random_seed(seed)
         
-        data_parallel_size = (
-            world_size // (tensor_model_parallel_size * pipeline_model_parallel_size))
+            llama_args.use_sp = use_sp
+            models = build_model(model_provider,
+                        wrap_with_ddp,
+                        virtual_pipeline_model_parallel_size,
+                        args=llama_args)
+            torch.cuda.empty_cache()  # frees ~9GB
         
-        vocab_size = 32_000
-        loaded_args = json.load(open(model_dir / "params.json", "r"))
-        loaded_args["vocab_size"] = vocab_size
-        llama_args = ModelArgs(
-            **loaded_args,
-            device="cuda"
-        )
-        
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-        torch.backends.cudnn.benchmark = True
-        
-        forward_backward_func = get_forward_backward_func(
-            virtual_pipeline_model_parallel_size, pipeline_model_parallel_size)
-        if seed is None:
-            seed = random.randrange(0, 2 ^ 31)
-        set_random_seed(seed)
-    
-        models = build_model(lambda args, **_:
-                        PipelineStage(Transformer(args,
-                                                dtype=torch.bfloat16,
-                                                use_sp=use_sp)),
-                    wrap_with_ddp,
-                    virtual_pipeline_model_parallel_size,
-                    args=llama_args)
-        torch.cuda.empty_cache()  # frees ~9GB
-    
-        main_fn(models, dict(
-            rank=rank,
-            local_rank=local_rank,
-            data_parallel_size=data_parallel_size,
-            llama_args=llama_args,
-            model_dir=model_dir,
-            tp_rank=tp_rank,
-            pp_rank=pp_rank,
-            use_sp=use_sp,
-            wrap_with_ddp=wrap_with_ddp,
-            forward_backward_func=forward_backward_func
-            ), *args, **kwargs)
-    return main
+            main_fn(models, dict(
+                rank=rank,
+                local_rank=local_rank,
+                data_parallel_size=data_parallel_size,
+                llama_args=llama_args,
+                model_dir=model_dir,
+                tp_rank=tp_rank,
+                pp_rank=pp_rank,
+                use_sp=use_sp,
+                wrap_with_ddp=wrap_with_ddp,
+                forward_backward_func=forward_backward_func
+                ), *args, **kwargs)
+        return main
+    return decorator
 
 
 def load_consolidated_weights(models, path: Path, wrap_with_ddp: bool):

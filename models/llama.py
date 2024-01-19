@@ -25,6 +25,7 @@ class ModelArgs:
     max_seq_len: int = 2048
 
     device: Optional[str] = None
+    use_sp: bool = False
 
 
 class ColumnParallelLinear(tensor_parallel.ColumnParallelLinear):
