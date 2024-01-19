@@ -1,4 +1,5 @@
 from models.llama import ModelArgs
+from models.neox import NeoXArgs
 
 from apex.transformer.pipeline_parallel import get_forward_backward_func, build_model
 from apex.transformer import parallel_state, tensor_parallel
@@ -25,24 +26,6 @@ def set_random_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     tensor_parallel.model_parallel_cuda_manual_seed(seed)
-
-
-def convert_weight_for_tp(weight, key):
-    if key.endswith("w2.weight") or key.endswith("wo.weight"):
-        # row parallel
-        dim = 1
-    elif (key.endswith("w1.weight") or key.endswith("w3.weight")
-         or key.endswith("wq.weight") or key.endswith("wk.weight") or key.endswith("wv.weight")
-         or key.endswith("output.weight") or key.endswith("tok_embeddings.weight")):
-        dim = 0
-    else:
-        return weight
-    tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    tp_size = parallel_state.get_tensor_model_parallel_world_size()
-    chunk_size = weight.shape[dim] // tp_size
-    return weight.transpose(dim, 0)[
-        chunk_size*tp_rank:chunk_size*(tp_rank+1)
-    ].transpose(0, dim)
 
 
 def main_with_model(model_provider, model_args_cls):
@@ -123,10 +106,59 @@ def main_with_model(model_provider, model_args_cls):
     return decorator
 
 
-def load_consolidated_weights(models, path: Path, wrap_with_ddp: bool):
+def convert_weight_for_tp(weight, parallel_dimension):
+    if parallel_dimension is None:
+        return weight
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    chunk_size = weight.shape[parallel_dimension] // tp_size
+    return weight.transpose(parallel_dimension, 0)[
+        chunk_size*tp_rank:chunk_size*(tp_rank+1)
+    ].transpose(0, parallel_dimension)
+
+def parallel_dimension_llama(key):
+    if key.endswith("w2.weight") or key.endswith("wo.weight"):
+        # row parallel
+        return 1
+    elif (key.endswith("w1.weight") or key.endswith("w3.weight")
+         or key.endswith("wq.weight") or key.endswith("wk.weight") or key.endswith("wv.weight")
+         or key.endswith("output.weight") or key.endswith("tok_embeddings.weight")):
+        return 0
+    else:
+        return None
+
+def load_consolidated_llama_weights(models, path: Path, wrap_with_ddp: bool):
     state_dict = torch.load(str(path), mmap=True)
     state_dict = {f"{'module.' if wrap_with_ddp else ''}wrapped." + k: v for k, v in state_dict.items()}
     state_dict = {k: state_dict[k] for k in models[0].state_dict().keys()}
-    state_dict = {k: convert_weight_for_tp(v, k) for k, v in state_dict.items()}
+    state_dict = {k: convert_weight_for_tp(v, parallel_dimension_llama(k))
+                  for k, v in state_dict.items()}
+    models[0].load_state_dict(state_dict)
+    del state_dict
+
+def parallel_dimension_neox(key):
+    if key.endswith("dense_4h_to_h.weight") or key.endswith("dense.weight"):
+        # row parallel
+        return 1
+    elif (key.endswith("dense_h_to_4h.weight") or
+         key.endswith("query.weight") or key.endswith("key.weight") or key.endswith("value.weight") or
+         key.endswith("embed_in.weight") or key.endswith("embed_out.weight")):
+        return 0
+    else:
+        return None
+
+def load_consolidated_neox_weights(models, model_args: NeoXArgs, path: Path, wrap_with_ddp):
+    state_dict = torch.load(str(path), mmap=True)
+    prefix = f"{'module.' if wrap_with_ddp else ''}wrapped."
+    state_dict = {prefix +
+                  k.removeprefix("gpt_neox."): v for k, v in state_dict.items()}
+    for layer in range(model_args.num_hidden_layers):
+        for param in ("weight", "bias"):
+            qkv = state_dict.pop(prefix + f"layers.{layer}.attention.query_key_value.{param}")
+            for name, tensor in zip(("query", "key", "value"), qkv.chunk(3)):
+                state_dict[prefix + f"layers.{layer}.attention.{name}.{param}"] = tensor
+    state_dict = {k: state_dict[k] for k in models[0].state_dict().keys()}        
+    state_dict = {k: convert_weight_for_tp(v, parallel_dimension_neox(k))
+                  for k, v in state_dict.items()}
     models[0].load_state_dict(state_dict)
     del state_dict

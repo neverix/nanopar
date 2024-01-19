@@ -37,18 +37,6 @@ def train_step(batch, model):
     return out, lambda pred: loss_fn(pred, label, logprobs)
 
 
-# def inference_step(batch, model):
-#     tokens, *kv_cache = batch
-#     out = model(tokens[:, -1:], start_pos=0, kv_cache=kv_cache)
-#     return (out, *kv_cache), (lambda pred: (0, {"pred": pred}))
-
-
-def inference_step_dumb(batch, model):
-    tokens = batch
-    out = model(tokens, start_pos=0, kv_cache=None)
-    return out, (lambda pred: (0, {"pred": pred}))
-
-
 @main_with_model
 def main(models, kwargs, data_dir=Path("data/logprob"), grad_acc: int = 8):
     rank, data_parallel_size, llama_args, model_dir, forward_backward_func, use_sp, wrap_with_ddp = [

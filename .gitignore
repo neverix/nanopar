@@ -161,6 +161,7 @@ cython_debug/
 
 # Ignore weights
 llama-2-*
+pythia-*
 tokenizer.model
 sampling_tests.ipynb
 

@@ -265,7 +265,7 @@ class SplitNeoX(nn.Module):
             )
 
         if self.pp_rank == self.pp_world - 1:
-            self.embed_output = tensor_parallel.ColumnParallelLinear(
+            self.embed_out = tensor_parallel.ColumnParallelLinear(
                 args.hidden_size,
                 args.vocab_size,
                 bias=False,
@@ -314,7 +314,7 @@ class SplitNeoX(nn.Module):
 
         if self.pp_rank == self.pp_world - 1:
             x = self.final_layer_norm(x)
-            x = add_bias(self.embed_output(x))
+            x = add_bias(self.embed_out(x))
             return x
         else:
             return x
