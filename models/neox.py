@@ -39,6 +39,7 @@ torch._dynamo.config.cache_size_limit = 1000
 @dataclass
 class NeoXArgs:
     hidden_size: int = 512
+    vocab_size: int = 50304
     layer_norm_eps: float = 1e-6
     num_hidden_layers: int = 8
     num_attention_heads: int = 8
@@ -48,6 +49,8 @@ class NeoXArgs:
     intermediate_size: int = 2048
     hidden_act: str = "gelu"
     use_parallel_residual: bool = True
+    device: Optional[str] = None
+    use_sp: bool = False
 
 
 def precompute_freqs(dim: int, end: int, theta: float = 10000.0):
@@ -62,11 +65,11 @@ def reshape_for_broadcast(freqs, x_shape):
     ndim = len(x_shape)
     assert 0 <= 1 < ndim
     assert freqs.shape == (
-        x_shape[1],
+        x_shape[0],
         x_shape[-2],
         x_shape[-1],
     ), f"{freqs.shape=} not compatible with {x_shape=}"
-    shape = [d if i == 1 or i >= ndim - 2 else 1 for i, d in enumerate(x_shape)]
+    shape = [d if i == 0 or i >= ndim - 2 else 1 for i, d in enumerate(x_shape)]
     return freqs.view(*shape)
 
 
@@ -84,7 +87,7 @@ def cmul(x, y):
 def apply_rotary_emb(
     x: torch.Tensor,
     freqs: torch.Tensor,
-) -> torch.Tensor:
+) -> torch.Tensor:    
     x_ = x.float().reshape(*x.shape[:-1], -1, 2)
     x_out = cmul(x_, freqs).flatten(3)
     return x_out.type_as(x)
@@ -101,19 +104,29 @@ class GPTNeoXAttention(nn.Module):
     def __init__(self, args: NeoXArgs, dtype: torch.dtype = torch.float32):
         super().__init__()
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        assert args.n_heads % tp_size == 0
+        assert args.num_attention_heads % tp_size == 0
         self.n_local_heads = args.num_attention_heads // tp_size
         self.head_dim = args.hidden_size // args.num_attention_heads
 
-        self.query_key_value = tensor_parallel.ColumnParallelLinear(
+        # separate so it doesn't break with model paralellism
+        # self.query_key_value = tensor_parallel.ColumnParallelLinear(
+        #     args.hidden_size,
+        #     args.hidden_size * 3,
+        #     bias=True,
+        #     gather_output=False,
+        #     params_dtype=dtype,
+        #     sequence_parallel_enabled=True,
+        #     no_async_tensor_model_parallel_allreduce=True,
+        # )
+        self.query, self.key, self.value = (tensor_parallel.ColumnParallelLinear(
             args.hidden_size,
-            args.hidden_size * 3,
+            args.hidden_size,
             bias=True,
             gather_output=False,
             params_dtype=dtype,
             sequence_parallel_enabled=True,
             no_async_tensor_model_parallel_allreduce=True,
-        )
+        ) for _ in "QKV")
 
         self.dense = tensor_parallel.RowParallelLinear(
             args.hidden_size,
@@ -135,27 +148,28 @@ class GPTNeoXAttention(nn.Module):
         seqlen, bsz, _ = x.shape
 
         x = x.contiguous()
-        qkv = add_bias(self.query_key_value(x))
-        qkv = rearrange(qkv, "s b (qkv hd) -> qkv s b hd", qkv=3)
-
-        xq, xk, xv = qkv.unbind(0)
+        xq, xk, xv = map(add_bias, (self.query(x), self.key(x), self.value(x)))
+        xq, xk, xv = (
+            rearrange(x, "s b (nh hd) -> s b nh hd", nh=self.n_local_heads)
+            for x in (xq, xk, xv))
 
         xk = apply_rotary_emb(xk, freqs=kv_freqs)
         xq = apply_rotary_emb(xq, freqs=q_freqs)
 
-        xk = rearrange(xk, "b s nh hd -> b nh s hd")
-        xv = rearrange(xv, "b s nh hd -> b nh s hd")
-        xq = rearrange(xq, "b s nh hd -> b nh s hd")
+        xk = rearrange(xk, "s b nh hd -> b nh s hd")
+        xv = rearrange(xv, "s b nh hd -> b nh s hd")
+        xq = rearrange(xq, "s b nh hd -> b nh s hd")
 
         causal = mask is None
         with torch.backends.cuda.sdp_kernel(
             enable_math=causal, enable_flash=True, enable_mem_efficient=False
         ):
             output = F.scaled_dot_product_attention(
-                xq, xk, xv, is_causal=causal, mask=mask
+                xq, xk, xv, is_causal=causal, attn_mask=mask
             )
             output = rearrange(output, "b nh s hd -> s b (nh hd)").contiguous()
-            return add_bias(self.wo(output))
+            output = add_bias(self.dense(output))
+            return output
 
 
 class GPTNeoXMLP(nn.Module):
@@ -189,7 +203,7 @@ class GPTNeoXMLP(nn.Module):
         )
 
     def forward(self, x):
-        return self.dense_4h_to_h(F.gelu(self.dense_h_to_4h(x)))
+        return add_bias(self.dense_4h_to_h(F.gelu(add_bias(self.dense_h_to_4h(x)))))
 
 
 class TransformerBlock(nn.Module):
@@ -217,10 +231,12 @@ class TransformerBlock(nn.Module):
     ):
         x0 = self.input_layernorm(x)
         x1 = self.post_attention_layernorm(x)
+        x0_attn = self.attention(x0, start_pos, kv_freqs, q_freqs, mask)
+        x1_mlp = self.mlp(x1)
         return (
             x
-            + self.attention(x0, start_pos, kv_freqs, q_freqs, mask)
-            + self.feed_forward(x1)
+            + x0_attn
+            + x1_mlp
         )
 
 
@@ -232,7 +248,7 @@ class SplitNeoX(nn.Module):
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
         self.tp_world = parallel_state.get_tensor_model_parallel_world_size()
 
-        curr_rank_layers = args.n_layers // self.pp_world
+        curr_rank_layers = args.num_hidden_layers // self.pp_world
         start_layer = self.pp_rank * curr_rank_layers
 
         self.layers = nn.ModuleList(
@@ -241,11 +257,11 @@ class SplitNeoX(nn.Module):
                 for i in range(curr_rank_layers)
             ]
         )
-        self.freqs = precompute_freqs(args.dim // args.n_heads, args.max_seq_len * 2)
+        self.freqs = precompute_freqs(args.hidden_size // args.num_attention_heads, args.max_position_embeddings * 2)
 
         if self.pp_rank == 0:
             self.embed_in = tensor_parallel.VocabParallelEmbedding(
-                args.vocab_size, args.dim, params_dtype=dtype
+                args.vocab_size, args.hidden_size, params_dtype=dtype
             )
 
         if self.pp_rank == self.pp_world - 1:
@@ -258,7 +274,7 @@ class SplitNeoX(nn.Module):
                 sequence_parallel_enabled=True,
                 no_async_tensor_model_parallel_allreduce=True,
             )
-            self.final_layer_norm = nn.LayerNorm(args.dim, eps=args.layer_norm_eps)
+            self.final_layer_norm = nn.LayerNorm(args.hidden_size, eps=args.layer_norm_eps)
 
         self.args = args
 
@@ -269,7 +285,7 @@ class SplitNeoX(nn.Module):
             x = layer(x, start_pos, kv_freqs, q_freqs, mask)
         return x
 
-    def forward(self, tokens_or_hidden_state: torch.Tensor, start_pos: int):
+    def forward(self, tokens_or_hidden_state: torch.Tensor, start_pos: int = 0):
         if self.pp_rank == 0:
             x = self.embed_in(tokens_or_hidden_state)
             x = rearrange(x, "b s d -> s b d")
@@ -289,16 +305,16 @@ class SplitNeoX(nn.Module):
 
         n_heads = self.args.num_attention_heads
         head_dim = self.args.hidden_size // n_heads
-        kv_shape = (batch_size, total_seq_len, n_heads, head_dim // 2, 2)
-        q_shape = (batch_size, total_seq_len, n_heads, head_dim // 2, 2)
+        kv_shape = (total_seq_len, batch_size, n_heads, head_dim // 2, 2)
+        q_shape = (total_seq_len, batch_size, n_heads, head_dim // 2, 2)
         kv_freqs = reshape_for_broadcast(kv_freqs, kv_shape).to(x.device)
         q_freqs = reshape_for_broadcast(q_freqs, q_shape).to(x.device)
 
         x = self.transformer_block(x, start_pos, kv_freqs, q_freqs, mask=None)
 
         if self.pp_rank == self.pp_world - 1:
-            x = self.norm(x)
-            x = add_bias(self.output(x))
+            x = self.final_layer_norm(x)
+            x = add_bias(self.embed_output(x))
             return x
         else:
             return x
@@ -323,5 +339,6 @@ class PipelineStage(nn.Module):
         return self.wrapped(*inputs, **kwargs)
 
 
-def model_provider_func(llama_args, *args, **kwargs):
-    return PipelineStage(SplitNeoX(llama_args, dtype=torch.bfloat16))
+def neox_model_provider(args, **_):
+    return PipelineStage(SplitNeoX(args,
+                                   dtype=torch.bfloat16))

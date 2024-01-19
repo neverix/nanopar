@@ -1,5 +1,6 @@
 from loading_utils import main_with_model, load_consolidated_weights
-from models.llama import Transformer, PipelineStage
+from models.llama import llama_model_provider, ModelArgs
+from models.neox import neox_model_provider, NeoXArgs
 
 from apex.transformer.pipeline_parallel.utils import setup_microbatch_calculator
 from apex.transformer import tensor_parallel
@@ -31,14 +32,14 @@ def cache_logprob(batch, model):
 
 
 @torch.inference_mode()
-@main_with_model(lambda args, **_:
-                        PipelineStage(Transformer(args,
-                                                dtype=torch.bfloat16,
-                                                use_sp=args.use_sp)))
+@main_with_model(
+    # llama_model_provider, ModelArgs
+    neox_model_provider, NeoXArgs
+)
 def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logprob")):
-    rank, data_parallel_size, llama_args, model_dir, use_sp, wrap_with_ddp, forward_backward_func = [
+    rank, data_parallel_size, model_args, model_dir, use_sp, wrap_with_ddp, forward_backward_func = [
         kwargs[k] for k in
-        ["rank", "data_parallel_size", "llama_args", "model_dir", "use_sp", "wrap_with_ddp", "forward_backward_func"]]
+        ["rank", "data_parallel_size", "model_args", "model_dir", "use_sp", "wrap_with_ddp", "forward_backward_func"]]
     
     global_batch_size = 32
     micro_batch_size = 32
@@ -53,7 +54,7 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
         data_parallel_size=data_parallel_size,
     )
     
-    load_consolidated_weights(models, model_dir / "consolidated.00.pth", wrap_with_ddp)
+    # load_consolidated_weights(models, model_dir / "consolidated.00.pth", wrap_with_ddp)
     
     # https://github.com/mosaicml/streaming/blob/release/v0.7.1/streaming/multimodal/convert/webvid/extract_webvid_videos.py
     # no special utility for processing StreamingDatasets
@@ -71,7 +72,7 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
                 models,
                 forward_only=True,
                 # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
-                tensor_shape=(seq_len - 1, micro_batch_size, llama_args.dim),
+                tensor_shape=(seq_len - 1, micro_batch_size, model_args.hidden_size),
                 # T4 doesn't have bfloat16
                 dtype=torch.float16,
                 async_comm=True,

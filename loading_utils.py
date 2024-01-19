@@ -45,10 +45,16 @@ def convert_weight_for_tp(weight, key):
     ].transpose(0, dim)
 
 
-def main_with_model(model_provider):
+def main_with_model(model_provider, model_args_cls):
     def decorator(main_fn):
         def main(*args,
-                model_dir=Path("llama-2-7b"),
+                 
+                # model_dir=Path("llama-2-7b"),
+                # params_file=Path("params.json"),
+                
+                model_dir=Path("pythia-14m"),
+                params_file=Path("config.json"),
+                
                 tensor_model_parallel_size = 1,
                 pipeline_model_parallel_size = 1,
                 virtual_pipeline_model_parallel_size: Optional[int] = None,
@@ -75,11 +81,12 @@ def main_with_model(model_provider):
             data_parallel_size = (
                 world_size // (tensor_model_parallel_size * pipeline_model_parallel_size))
             
-            vocab_size = 32_000
-            loaded_args = json.load(open(model_dir / "params.json", "r"))
-            loaded_args["vocab_size"] = vocab_size
-            llama_args = ModelArgs(
-                **loaded_args,
+            loaded_args = json.load(open(model_dir / params_file, "r"))
+            # vocab_size = 32_000
+            # loaded_args["vocab_size"] = vocab_size
+            model_args = model_args_cls(
+                **{k: v for k, v in loaded_args.items()
+                   if k in model_args_cls.__dataclass_fields__},
                 device="cuda"
             )
             
@@ -93,18 +100,18 @@ def main_with_model(model_provider):
                 seed = random.randrange(0, 2 ^ 31)
             set_random_seed(seed)
         
-            llama_args.use_sp = use_sp
+            model_args.use_sp = use_sp
             models = build_model(model_provider,
                         wrap_with_ddp,
                         virtual_pipeline_model_parallel_size,
-                        args=llama_args)
+                        args=model_args)
             torch.cuda.empty_cache()  # frees ~9GB
         
             main_fn(models, dict(
                 rank=rank,
                 local_rank=local_rank,
                 data_parallel_size=data_parallel_size,
-                llama_args=llama_args,
+                model_args=model_args,
                 model_dir=model_dir,
                 tp_rank=tp_rank,
                 pp_rank=pp_rank,

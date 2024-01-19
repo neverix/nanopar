@@ -165,7 +165,7 @@ class SelfAttention(nn.Module):
         kv_cache: Optional[Dict[str, torch.Tensor]] = None
     ):
         # TODO fix this
-        seq_len, batch_size, _ = x.shape  # (B, Seq_Len, Dim)
+        seq_len, batch_size, _ = x.shape  # (Seq_Len, B, Dim)
 
         # (Seq_Len, B, Dim) -> (Seq_Len, B, H_Q * Head_Dim)
         xq = self.wq(x)
@@ -413,3 +413,9 @@ class PipelineStage(nn.Module):
         else:
             inputs = self.input_tensors
         return self.wrapped(*inputs, **kwargs)
+
+
+def llama_model_provider(args, **_):
+    return PipelineStage(Transformer(args,
+                                     dtype=torch.bfloat16,
+                                    use_sp=args.use_sp))
