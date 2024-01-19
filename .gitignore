@@ -173,3 +173,4 @@ wandb/
 
 # Ignore code
 apex/
+TransformerEngine/
