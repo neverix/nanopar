@@ -45,6 +45,7 @@ def main_with_model(model_provider, model_args_cls):
                 wrap_with_ddp=False,
                 seed: Optional[int] = None,
                 **kwargs):
+            model_dir = Path(model_dir)
             rank = int(os.environ["RANK"])
             gpus_per_node = torch.cuda.device_count()  # TODO
         
@@ -133,8 +134,10 @@ def load_consolidated_llama_weights(models, path: Path, wrap_with_ddp: bool):
     state_dict = {k: state_dict[k] for k in models[0].state_dict().keys()}
     state_dict = {k: convert_weight_for_tp(v, parallel_dimension_llama(k))
                   for k, v in state_dict.items()}
-    models[0].load_state_dict(state_dict)
+    missing_keys, unexpected_keys = models[0].load_state_dict(state_dict)
     del state_dict
+    print("Missing keys:", missing_keys)
+    print("Unexpected keys:", unexpected_keys)
 
 def parallel_dimension_neox(key):
     if key.endswith("dense_4h_to_h.weight") or key.endswith("dense.weight"):
@@ -157,8 +160,11 @@ def load_consolidated_neox_weights(models, model_args: NeoXArgs, path: Path, wra
             qkv = state_dict.pop(prefix + f"layers.{layer}.attention.query_key_value.{param}")
             for name, tensor in zip(("query", "key", "value"), qkv.chunk(3)):
                 state_dict[prefix + f"layers.{layer}.attention.{name}.{param}"] = tensor
-    state_dict = {k: state_dict[k] for k in models[0].state_dict().keys()}        
     state_dict = {k: convert_weight_for_tp(v, parallel_dimension_neox(k))
                   for k, v in state_dict.items()}
-    models[0].load_state_dict(state_dict)
+    # print(models[0].state_dict().keys())
+    # exit()
+    missing_keys, unexpected_keys = models[0].load_state_dict(state_dict)
     del state_dict
+    print("Missing keys:", missing_keys)
+    print("Unexpected keys:", unexpected_keys)

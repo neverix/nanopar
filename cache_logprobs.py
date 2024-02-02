@@ -1,7 +1,9 @@
-from loading_utils import main_with_model, load_consolidated_neox_weights
+from loading_utils import main_with_model, load_consolidated_neox_weights, load_consolidated_llama_weights
 from models.llama import llama_model_provider, ModelArgs
 from models.neox import neox_model_provider, NeoXArgs
 from apex.transformer import parallel_state, tensor_parallel
+
+from sentencepiece import SentencePieceProcessor
 from transformers import AutoTokenizer
 
 from apex.transformer.pipeline_parallel.utils import setup_microbatch_calculator
@@ -15,6 +17,7 @@ import fire
 from functools import partial
 from pathlib import Path
 import shutil
+import os
 
 
 def loss_fn(pred, batch):
@@ -41,10 +44,12 @@ def inference_step_dumb(batch, model):
     return out, (lambda pred: (0, {"pred": pred}))
 
 
+MODEL_TYPE = os.environ.get("MODEL_TYPE") or "neox"
+
+
 @torch.inference_mode()
 @main_with_model(
-    # llama_model_provider, ModelArgs
-    neox_model_provider, NeoXArgs
+    *((llama_model_provider, ModelArgs) if MODEL_TYPE == "llama" else (neox_model_provider, NeoXArgs))
 )
 def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logprob"),
          test_inference: bool = False):
@@ -55,7 +60,8 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
     global_batch_size = 32
     micro_batch_size = 32
     batch_size = global_batch_size // data_parallel_size
-    seq_len = 129  # 2049
+    seq_len = 17  # 2049
+    hidden = model_args.hidden_size if MODEL_TYPE == "neox" else model_args.dim
     
     setup_microbatch_calculator(
         rank=rank,
@@ -65,8 +71,10 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
         data_parallel_size=data_parallel_size,
     )
     
-    # load_consolidated_llama_weights(models, model_dir / "consolidated.00.pth", wrap_with_ddp)
-    load_consolidated_neox_weights(models, model_args, model_dir / "pytorch_model.bin", wrap_with_ddp)
+    if MODEL_TYPE == "llama":
+        load_consolidated_llama_weights(models, model_dir / "consolidated.00.pth", wrap_with_ddp)
+    else:
+        load_consolidated_neox_weights(models, model_args, model_dir / "pytorch_model.bin", wrap_with_ddp)
     
     # https://github.com/mosaicml/streaming/blob/release/v0.7.1/streaming/multimodal/convert/webvid/extract_webvid_videos.py
     # no special utility for processing StreamingDatasets
@@ -79,18 +87,24 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
             tokens = batch["tokens"]
             tokens = tokens[..., -seq_len:].cuda()
             if test_inference:
-                # TODO
-                tokenizer = AutoTokenizer.from_pretrained(model_dir)
+                if MODEL_TYPE == "neox":
+                    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+                    decode = lambda x: [tokenizer.decode([u for u in y if u >= 0]) for y in x]
+                    tokens[..., 0] = tokenizer.encode("The")[0]  # BOS
+                else:
+                    tokenizer = SentencePieceProcessor(str(model_dir / "tokenizer.model"))
+                    tokens[..., 0] = tokenizer.Encode("The")[0]
+                    decode = lambda x: tokenizer.Decode(x)
                 inference(
                     local_rank=local_rank,
                     batch=tokens,
                     models=models,
                     forward_backward_func=forward_backward_func,
                     micro_batch_size=micro_batch_size,
-                    decode=lambda x: [tokenizer.decode(y) for y in x],
+                    decode=decode,
                     use_sp=use_sp,
                     vocab_size=model_args.vocab_size,
-                    hidden_dim=model_args.hidden_size   
+                    hidden_dim=hidden
                 )
                 return
             logprobs = forward_backward_func(
@@ -99,9 +113,8 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
                 models,
                 forward_only=True,
                 # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
-                tensor_shape=(seq_len - 1, micro_batch_size, model_args.hidden_size),
-                # T4 doesn't have bfloat16
-                dtype=torch.float16,
+                tensor_shape=(seq_len - 1, micro_batch_size, hidden),
+                dtype=torch.bfloat16,
                 async_comm=True,
                 sync_batch_comm=False,
                 sequence_parallel_enabled=use_sp,
@@ -121,7 +134,7 @@ def inference(models, forward_backward_func, batch, decode, vocab_size, hidden_d
     
     src = parallel_state.get_pipeline_model_parallel_last_rank()
     group = parallel_state.get_embedding_group()
-    for i in (trange if local_rank == 0 else range)(8, batch.shape[1] - 1):
+    for i in (trange if local_rank == 0 else range)(0, batch.shape[1] - 1):
         logits = forward_backward_func(
             inference_step_dumb,
             batch,
@@ -144,7 +157,10 @@ def inference(models, forward_backward_func, batch, decode, vocab_size, hidden_d
 
             # vocab is padded to maximize performance
             logits = logits[:, :, :vocab_size]
-            batch[:, i + 1] = logits[:, i].argmax(dim=-1)
+            logits = torch.softmax(logits[:, i], dim=-1)
+            logits[torch.isinf(logits)] = 0
+            logits[torch.isnan(logits)] = 0
+            batch[:, i + 1] = torch.multinomial(logits, 1).reshape(logits.shape[0])
             torch.distributed.broadcast(batch, src, group)
         elif parallel_state.is_pipeline_first_stage():
             torch.distributed.broadcast(batch, src, group)

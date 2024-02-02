@@ -160,8 +160,7 @@ cython_debug/
 #.idea/
 
 # Ignore weights
-llama-2-*
-pythia-*
+model_dir/
 tokenizer.model
 sampling_tests.ipynb
 

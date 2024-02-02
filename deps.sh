@@ -15,7 +15,7 @@ if [ ! -d TransformerEngine ] ; then
 fi
 cd TransformerEngine
 export NVTE_FRAMEWORK=pytorch   # Optionally set framework
-python -m pip install .                   # Build and install
+CUDNN_PATH=~/miniconda3/envs/nanopar python -m pip install .                   # Build and install
 cd ..
 
-python -m pip install -q mosaicml-streaming sentencepiece pandas pyarrow fire wandb einops
+python -m pip install -q mosaicml-streaming sentenc epiece pandas pyarrow fire wandb einops

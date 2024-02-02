@@ -89,8 +89,8 @@ def apply_rotary_emb(
     freqs: torch.Tensor,
 ) -> torch.Tensor:    
     x_ = x.float().reshape(*x.shape[:-1], -1, 2)
-    x_out = cmul(x_, freqs).flatten(3)
-    return x_out.type_as(x)
+    x_out = cmul(x_, freqs)
+    return x_out.reshape(x.shape).type_as(x)
 
 
 def add_bias(x: Tuple[torch.tensor, Optional[torch.Tensor]]):
@@ -100,8 +100,46 @@ def add_bias(x: Tuple[torch.tensor, Optional[torch.Tensor]]):
     return x
 
 
+class GPTNeoXRotaryEmbedding(nn.Module):
+    # Copied from https://github.com/huggingface/transformers/blob/3d2900e829ab16757632f9dde891f1947cfc4be0/src/transformers/models/gpt_neox/modeling_gpt_neox.py#L529~L563
+    # Copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding.__init__
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=True)
+
+        # Build here to make `torch.jit.trace` work.
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
+        )
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=torch.int64).type_as(self.inv_freq)
+
+        freqs = torch.outer(t, self.inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+
+        return (
+            self.cos_cached[:seq_len],
+            self.sin_cached[:seq_len],
+        )
+
+
 class GPTNeoXAttention(nn.Module):
-    def __init__(self, args: NeoXArgs, dtype: torch.dtype = torch.float32):
+    def __init__(self, args: NeoXArgs, dtype: torch.dtype = torch.float32, use_sp: bool = False):
         super().__init__()
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
         assert args.num_attention_heads % tp_size == 0
@@ -124,7 +162,7 @@ class GPTNeoXAttention(nn.Module):
             bias=True,
             gather_output=False,
             params_dtype=dtype,
-            sequence_parallel_enabled=True,
+            sequence_parallel_enabled=use_sp,
             no_async_tensor_model_parallel_allreduce=True,
         ) for _ in "QKV")
 
@@ -134,18 +172,36 @@ class GPTNeoXAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             params_dtype=dtype,
-            sequence_parallel_enabled=True,
+            sequence_parallel_enabled=use_sp,
         )
+        
+        self._init_bias(args.max_position_embeddings)
+        self.rotary_dims = int(self.head_dim * args.rotary_pct)
+        self.register_buffer("masked_bias", torch.tensor(-1e9), persistent=True)
+        self.rotary_emb = GPTNeoXRotaryEmbedding(
+            self.rotary_dims, args.max_position_embeddings, base=args.rotary_emb_base
+        )
+
+    def _init_bias(self, max_positions, device=None):
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones((max_positions, max_positions), dtype=torch.bool)).view(
+                1, 1, max_positions, max_positions
+            ),
+            persistent=True,
+        )
+        if device is not None:
+            self.bias = self.bias.to(device)
 
     def forward(
         self,
         x: torch.Tensor,
         start_pos: int,
-        kv_freqs: torch.Tensor,
-        q_freqs: torch.Tensor,
+        # kv_freqs: torch.Tensor,
+        # q_freqs: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
-        seqlen, bsz, _ = x.shape
+        seq_len, bsz, _ = x.shape
 
         x = x.contiguous()
         xq, xk, xv = map(add_bias, (self.query(x), self.key(x), self.value(x)))
@@ -153,8 +209,22 @@ class GPTNeoXAttention(nn.Module):
             rearrange(x, "s b (nh hd) -> s b nh hd", nh=self.n_local_heads)
             for x in (xq, xk, xv))
 
-        xk = apply_rotary_emb(xk, freqs=kv_freqs)
-        xq = apply_rotary_emb(xq, freqs=q_freqs)
+        freqs = torch.stack(self.rotary_emb(x, seq_len=seq_len), dim=-1).to(x.device)
+        kv_freqs = freqs
+        # sp_n_queries = seq_len // self.tp_world
+        q_freqs = kv_freqs
+        
+        n_heads = self.n_local_heads
+        kv_shape = (seq_len, bsz, n_heads, self.rotary_dims, 2)
+        q_shape = (seq_len, bsz, n_heads, self.rotary_dims, 2)
+        kv_freqs = reshape_for_broadcast(kv_freqs, kv_shape).to(x.device)
+        q_freqs = reshape_for_broadcast(q_freqs, q_shape).to(x.device)
+
+        xk[..., :self.rotary_dims * 2] = apply_rotary_emb(xk[..., :self.rotary_dims * 2], freqs=kv_freqs)
+        xq[..., :self.rotary_dims * 2] = apply_rotary_emb(xq[..., :self.rotary_dims * 2], freqs=q_freqs)
+        
+        # xk = apply_rotary_pct(xk, xkr, self.rotary_pct)
+        # xq = apply_rotary_pct(xq, xqr, self.rotary_pct)
 
         xk = rearrange(xk, "s b nh hd -> b nh s hd")
         xv = rearrange(xv, "s b nh hd -> b nh s hd")
@@ -167,9 +237,10 @@ class GPTNeoXAttention(nn.Module):
             output = F.scaled_dot_product_attention(
                 xq, xk, xv, is_causal=causal, attn_mask=mask
             )
-            output = rearrange(output, "b nh s hd -> s b (nh hd)").contiguous()
-            output = add_bias(self.dense(output))
-            return output
+
+        output = rearrange(output, "b nh s hd -> s b (nh hd)").contiguous()
+        output = add_bias(self.dense(output))
+        return output
 
 
 class GPTNeoXMLP(nn.Module):
@@ -178,28 +249,29 @@ class GPTNeoXMLP(nn.Module):
         dim: int,
         hidden_dim: int,
         dtype: torch.dtype = torch.float32,
+        use_sp: bool = False
     ):
         super().__init__()
 
         self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
             dim,
             hidden_dim,
-            bias=False,
+            bias=True,
             gather_output=False,
             init_method=lambda x: x,
             params_dtype=dtype,
-            sequence_parallel_enabled=True,
+            sequence_parallel_enabled=use_sp,
             no_async_tensor_model_parallel_allreduce=True,
         )
 
         self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
             hidden_dim,
             dim,
-            bias=False,
+            bias=True,
             input_is_parallel=True,
             init_method=lambda x: x,
             params_dtype=dtype,
-            sequence_parallel_enabled=True,
+            sequence_parallel_enabled=use_sp,
         )
 
     def forward(self, x):
@@ -225,13 +297,15 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         start_pos: int,
-        kv_freqs: torch.Tensor,
-        q_freqs: torch.Tensor,
+        # kv_freqs: torch.Tensor,
+        # q_freqs: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
         x0 = self.input_layernorm(x)
         x1 = self.post_attention_layernorm(x)
-        x0_attn = self.attention(x0, start_pos, kv_freqs, q_freqs, mask)
+        x0_attn = self.attention(x0, start_pos,
+                                #  kv_freqs, q_freqs,
+                                 mask)
         x1_mlp = self.mlp(x1)
         return (
             x
@@ -241,12 +315,13 @@ class TransformerBlock(nn.Module):
 
 
 class SplitNeoX(nn.Module):
-    def __init__(self, args: NeoXArgs, dtype: torch.dtype = torch.float32):
+    def __init__(self, args: NeoXArgs, dtype: torch.dtype = torch.float32, use_sp: bool = False):
         super().__init__()
         self.pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         self.pp_world = parallel_state.get_pipeline_model_parallel_world_size()
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
         self.tp_world = parallel_state.get_tensor_model_parallel_world_size()
+        self.use_sp = use_sp
 
         curr_rank_layers = args.num_hidden_layers // self.pp_world
         start_layer = self.pp_rank * curr_rank_layers
@@ -257,7 +332,6 @@ class SplitNeoX(nn.Module):
                 for i in range(curr_rank_layers)
             ]
         )
-        self.freqs = precompute_freqs(args.hidden_size // args.num_attention_heads, args.max_position_embeddings * 2)
 
         if self.pp_rank == 0:
             self.embed_in = tensor_parallel.VocabParallelEmbedding(
@@ -271,7 +345,7 @@ class SplitNeoX(nn.Module):
                 bias=False,
                 params_dtype=dtype,
                 gather_output=False,
-                sequence_parallel_enabled=True,
+                sequence_parallel_enabled=use_sp,
                 no_async_tensor_model_parallel_allreduce=True,
             )
             self.final_layer_norm = nn.LayerNorm(args.hidden_size, eps=args.layer_norm_eps)
@@ -280,37 +354,38 @@ class SplitNeoX(nn.Module):
 
     # factored out for torch.compile
     # @torch.compile
-    def transformer_block(self, x, start_pos, kv_freqs, q_freqs, mask):
+    def transformer_block(self, x, start_pos,
+                        #   kv_freqs, q_freqs,
+                          mask):
         for layer in self.layers:
-            x = layer(x, start_pos, kv_freqs, q_freqs, mask)
+            x = layer(x, start_pos,
+                    #   kv_freqs, q_freqs,
+                      mask)
         return x
 
     def forward(self, tokens_or_hidden_state: torch.Tensor, start_pos: int = 0):
         if self.pp_rank == 0:
             x = self.embed_in(tokens_or_hidden_state)
             x = rearrange(x, "b s d -> s b d")
-            x = tensor_parallel.mappings.scatter_to_sequence_parallel_region(x)
+            if self.use_sp:
+                x = tensor_parallel.mappings.scatter_to_sequence_parallel_region(x)
         else:
             x = tokens_or_hidden_state
 
         seq_len, batch_size, _ = x.shape
         total_seq_len = seq_len * self.tp_world
 
-        mask = torch.full((1, 1, seq_len, seq_len), float("-inf"), device=x.device)
-        mask = torch.triu(mask, diagonal=start_pos + 1).type_as(x)
+        # mask = torch.full((1, 1, seq_len, seq_len), float("-inf"), device=x.device)
+        # mask = torch.triu(mask, diagonal=start_pos + 1).type_as(x)
 
-        kv_freqs = self.freqs[start_pos : start_pos + total_seq_len].to(x.device)
-        sp_n_queries = seq_len // self.tp_world
-        q_freqs = kv_freqs
+        # n_heads = self.args.num_attention_heads
+        # head_dim = self.args.hidden_size // n_heads
+        # kv_shape = (total_seq_len, batch_size, n_heads, head_dim // 2, 2)
+        # q_shape = (total_seq_len, batch_size, n_heads, head_dim // 2, 2)
+        # kv_freqs = reshape_for_broadcast(kv_freqs, kv_shape).to(x.device)
+        # q_freqs = reshape_for_broadcast(q_freqs, q_shape).to(x.device)
 
-        n_heads = self.args.num_attention_heads
-        head_dim = self.args.hidden_size // n_heads
-        kv_shape = (total_seq_len, batch_size, n_heads, head_dim // 2, 2)
-        q_shape = (total_seq_len, batch_size, n_heads, head_dim // 2, 2)
-        kv_freqs = reshape_for_broadcast(kv_freqs, kv_shape).to(x.device)
-        q_freqs = reshape_for_broadcast(q_freqs, q_shape).to(x.device)
-
-        x = self.transformer_block(x, start_pos, kv_freqs, q_freqs, mask=None)
+        x = self.transformer_block(x, start_pos, mask=None)
 
         if self.pp_rank == self.pp_world - 1:
             x = self.final_layer_norm(x)
@@ -341,4 +416,6 @@ class PipelineStage(nn.Module):
 
 def neox_model_provider(args, **_):
     return PipelineStage(SplitNeoX(args,
-                                   dtype=torch.bfloat16))
+                                   dtype=torch.bfloat16
+                                #    dtype=torch.float32
+                                   ))

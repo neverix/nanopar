@@ -109,7 +109,7 @@ def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device
     # Which results in the rotation of the complex number as shown in the Figure 1 of the paper
     # (B, Seq_Len, H, Head_Dim/2) * (1, Seq_Len, 1, Head_Dim/2) = (B, Seq_Len, H, Head_Dim/2)
     x_rotated = x_complex * freqs_complex
-    # Convert the complex number back to the real number
+    # Convert the complex number back to the real n umber
     # (B, Seq_Len, H, Head_Dim/2) -> (B, Seq_Len, H, Head_Dim/2, 2)
     x_out = torch.view_as_real(x_rotated)
     # (B, Seq_Len, H, Head_Dim/2, 2) -> (B, Seq_Len, H, Head_Dim)
