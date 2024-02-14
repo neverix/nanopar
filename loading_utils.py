@@ -14,6 +14,49 @@ import json
 import os
 
 
+class LlamaConsolidatedLoader(dict):
+    def __init__(self, path):
+        prefix = ".".join(str(path).split(".")[:-2])
+        self.files = []
+        for i in range(100):
+            filename = f"{prefix}.{i:02d}.pth"
+            if not os.path.exists(filename):
+                continue
+            self.files.append(torch.load(f"{prefix}.{i:02d}.pth", mmap=True, map_location=None if torch.cuda.device_count() > 1 else "cuda:0"))
+
+    def __getitem__(self, parameter_name):
+        tensors = []
+        for f in self.files:
+            if parameter_name in f:
+                tensors.append(f[parameter_name])
+        key_to_dim = {
+            "w1": 0,
+            "w2": -1,
+            "w3": 0,
+            "wo": -1,
+            "wq": 0,
+            "wk": 0,
+            "wv": 0,
+            "output": 0,
+            "tok_embeddings": -1,
+            "ffn_norm": None,
+            "attention_norm": None,
+            "norm": None,
+            "rope": None,
+        }
+        short_name = parameter_name.split(".")[-2]
+        dim = key_to_dim[short_name]
+        if dim is None:
+            return tensors[0]
+        return torch.cat(tensors, dim)
+    
+    def items(self):
+        all_keys = set(k for file in self.files for k in file.keys())
+        for k in all_keys:
+            yield k, self[k]
+            
+
+
 # from apex
 def set_random_seed(seed: int):
     """Set random seed for reproducibility."""
@@ -129,7 +172,7 @@ def parallel_dimension_llama(key):
         return None
 
 def load_consolidated_llama_weights(models, path: Path, wrap_with_ddp: bool):
-    state_dict = torch.load(str(path), mmap=True)
+    state_dict = LlamaConsolidatedLoader(path)
     state_dict = {f"{'module.' if wrap_with_ddp else ''}wrapped." + k: v for k, v in state_dict.items()}
     state_dict = {k: state_dict[k] for k in models[0].state_dict().keys()}
     state_dict = {k: convert_weight_for_tp(v, parallel_dimension_llama(k))

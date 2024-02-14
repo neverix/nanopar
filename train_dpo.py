@@ -1,9 +1,11 @@
 from apex.transformer.pipeline_parallel.utils import setup_microbatch_calculator, average_losses_across_data_parallel_group
 from apex.transformer import parallel_state, tensor_parallel
 from apex.contrib.optimizers.distributed_fused_adam import DistributedFusedAdam
+from models.llama import llama_model_provider, ModelArgs
+from models.neox import neox_model_provider, NeoXArgs
 # from apex.optimizers.fused_adam import FusedAdam
 
-from loading_utils import main_with_model, load_consolidated_weights
+from loading_utils import main_with_model, load_consolidated_llama_weights, load_consolidated_neox_weights
 
 from streaming import StreamingDataset
 from pathlib import Path
@@ -11,6 +13,7 @@ from tqdm import tqdm
 import wandb
 import torch
 import fire
+import os
 
 
 def loss_fn(pred, label, logprobs, beta=0.1):
@@ -37,11 +40,16 @@ def train_step(batch, model):
     return out, lambda pred: loss_fn(pred, label, logprobs)
 
 
-@main_with_model
+MODEL_TYPE = os.environ.get("MODEL_TYPE") or "neox"
+
+
+@main_with_model(
+    *((llama_model_provider, ModelArgs) if MODEL_TYPE == "llama" else (neox_model_provider, NeoXArgs))
+)
 def main(models, kwargs, data_dir=Path("data/logprob"), grad_acc: int = 8):
-    rank, data_parallel_size, llama_args, model_dir, forward_backward_func, use_sp, wrap_with_ddp = [
+    rank, data_parallel_size, model_dir, forward_backward_func, use_sp, wrap_with_ddp, model_args = [
         kwargs[k] for k in
-        ["rank", "data_parallel_size", "llama_args", "model_dir", "forward_backward_func", "use_sp", "wrap_with_ddp"]]
+        ["rank", "data_parallel_size", "model_dir", "forward_backward_func", "use_sp", "wrap_with_ddp", "model_args"]]
     
     global_batch_size = 1
     micro_batch_size = 1
@@ -54,7 +62,10 @@ def main(models, kwargs, data_dir=Path("data/logprob"), grad_acc: int = 8):
         data_parallel_size=data_parallel_size,
     )
     
-    load_consolidated_weights(models, model_dir / "consolidated.00.pth", wrap_with_ddp)
+    if MODEL_TYPE == "llama":
+        load_consolidated_llama_weights(models, model_dir / "consolidated.00.pth", wrap_with_ddp)
+    else:
+        load_consolidated_neox_weights(models, model_args, model_dir / "pytorch_model.bin", wrap_with_ddp)
 
     # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
     batch_size = global_batch_size // data_parallel_size

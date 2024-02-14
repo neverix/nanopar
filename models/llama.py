@@ -147,7 +147,7 @@ class SelfAttention(nn.Module):
         self.head_dim = args.dim // args.n_heads
 
         self.wq = ColumnParallelLinear(
-            args.dim, args.n_heads * self.head_dim, dtype=dtype, use_sp=use_sp)
+            args.dim, self.n_heads_q * self.head_dim, dtype=dtype, use_sp=use_sp)
         self.wk = ColumnParallelLinear(
             args.dim, self.n_kv_heads * self.head_dim, dtype=dtype, use_sp=use_sp)
         self.wv = ColumnParallelLinear(

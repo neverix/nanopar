@@ -14,7 +14,7 @@ import os
 
 
 def main(
-    model_dir = Path("llama-2-7b"),
+    model_dir = Path("model_dir/llama-2-13b"),
     train_ds_size = 1024,
     seq_len = 2049,
     use_pile=False,
