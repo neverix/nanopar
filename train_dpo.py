@@ -1,6 +1,7 @@
 from apex.transformer.pipeline_parallel.utils import setup_microbatch_calculator, average_losses_across_data_parallel_group
 from apex.transformer import parallel_state, tensor_parallel
 from apex.contrib.optimizers.distributed_fused_adam import DistributedFusedAdam
+from apex.contrib.optimizers.fused_adam import FusedAdam
 from models.llama import llama_model_provider, ModelArgs
 from models.neox import neox_model_provider, NeoXArgs
 # from apex.optimizers.fused_adam import FusedAdam
@@ -75,18 +76,26 @@ def main(models, kwargs, data_dir=Path("data/logprob"), grad_acc: int = 8):
 
     lr = 1e-5
     weight_decay = 1e-6
-    optimizer = DistributedFusedAdam(
-        models[0].parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-        process_group=parallel_state.get_data_parallel_group(),
-        dtype=torch.bfloat16,
-        # TODO distribute over DP group?
-        # distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
-        # redundant_process_group=parallel_state.get_data_parallel_group(),
-        store_params=False,
-    )
-    optimizer.init_param_buffer()
+    distributed_adam = False
+    if distributed_adam:
+        optimizer = DistributedFusedAdam(
+            models[0].parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+            process_group=parallel_state.get_data_parallel_group(),
+            dtype=torch.float16,
+            # TODO distribute over DP group?
+            # distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
+            # redundant_process_group=parallel_state.get_data_parallel_group(),
+            store_params=False,
+        )
+        optimizer.init_param_buffer()
+    else:
+        optimizer = FusedAdam(
+            models[0].parameters(),
+            lr=lr,
+            weight_decay=weight_decay
+        )
     
     wandb.init(
         mode="offline",
@@ -101,7 +110,7 @@ def main(models, kwargs, data_dir=Path("data/logprob"), grad_acc: int = 8):
             sample,
             models,
             forward_only=False,
-            tensor_shape=(llama_args.max_seq_len, micro_batch_size, llama_args.dim),
+            tensor_shape=(model_args.max_seq_len, micro_batch_size, model_args.dim),
             dtype=torch.bfloat16,
             async_comm=True,
             sync_batch_comm=False,
