@@ -47,7 +47,9 @@ MODEL_TYPE = os.environ.get("MODEL_TYPE") or "neox"
 @main_with_model(
     *((llama_model_provider, ModelArgs) if MODEL_TYPE == "llama" else (neox_model_provider, NeoXArgs))
 )
-def main(models, kwargs, data_dir=Path("data/logprob"), grad_acc: int = 8):
+def main(models, kwargs, data_dir=Path("data/logprob"),
+         grad_acc: int = 8,
+         distributed_adam: bool = True):
     rank, data_parallel_size, model_dir, forward_backward_func, use_sp, wrap_with_ddp, model_args = [
         kwargs[k] for k in
         ["rank", "data_parallel_size", "model_dir", "forward_backward_func", "use_sp", "wrap_with_ddp", "model_args"]]
@@ -76,7 +78,6 @@ def main(models, kwargs, data_dir=Path("data/logprob"), grad_acc: int = 8):
 
     lr = 1e-5
     weight_decay = 1e-6
-    distributed_adam = False
     if distributed_adam:
         optimizer = DistributedFusedAdam(
             models[0].parameters(),
