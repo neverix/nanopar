@@ -144,7 +144,8 @@ def main_with_model(model_provider, model_args_cls):
                 pp_rank=pp_rank,
                 use_sp=use_sp,
                 wrap_with_ddp=wrap_with_ddp,
-                forward_backward_func=forward_backward_func
+                forward_backward_func=forward_backward_func,
+                world_size=world_size
                 ), *args, **kwargs)
         return main
     return decorator
@@ -179,8 +180,8 @@ def load_consolidated_llama_weights(models, path: Path, wrap_with_ddp: bool):
                   for k, v in state_dict.items()}
     missing_keys, unexpected_keys = models[0].load_state_dict(state_dict)
     del state_dict
-    print("Missing keys:", missing_keys)
-    print("Unexpected keys:", unexpected_keys)
+    # print("Missing keys:", missing_keys)
+    # print("Unexpected keys:", unexpected_keys)
 
 def parallel_dimension_neox(key):
     if key.endswith("dense_4h_to_h.weight") or key.endswith("dense.weight"):

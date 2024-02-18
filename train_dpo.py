@@ -49,13 +49,17 @@ MODEL_TYPE = os.environ.get("MODEL_TYPE") or "neox"
 )
 def main(models, kwargs, data_dir=Path("data/logprob"),
          grad_acc: int = 8,
-         distributed_adam: bool = True):
-    rank, data_parallel_size, model_dir, forward_backward_func, use_sp, wrap_with_ddp, model_args = [
+         distributed_adam: bool = True,
+         lr: float = 1e-5,
+         weight_decay: float = 1e-6,
+         global_batch_size: int = 1,
+         micro_batch_size: int = 1,
+         save_dir = "./save_dir",
+         save_every: int = 100
+         ):
+    rank, data_parallel_size, model_dir, forward_backward_func, use_sp, wrap_with_ddp, model_args, world_size = [
         kwargs[k] for k in
-        ["rank", "data_parallel_size", "model_dir", "forward_backward_func", "use_sp", "wrap_with_ddp", "model_args"]]
-    
-    global_batch_size = 1
-    micro_batch_size = 1
+        ["rank", "data_parallel_size", "model_dir", "forward_backward_func", "use_sp", "wrap_with_ddp", "model_args", "world_size"]]
     
     setup_microbatch_calculator(
         rank=rank,
@@ -73,18 +77,16 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
     # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
     batch_size = global_batch_size // data_parallel_size
 
-    dataset = StreamingDataset(local="local/dpo", remote=data_dir, shuffle=True)
+    dataset = StreamingDataset(local=f"local/dpo{rank}", remote=data_dir, shuffle=True)
     dl = torch.utils.data.DataLoader(dataset, shuffle=False, batch_size=batch_size)
 
-    lr = 1e-5
-    weight_decay = 1e-6
     if distributed_adam:
         optimizer = DistributedFusedAdam(
             models[0].parameters(),
             lr=lr,
             weight_decay=weight_decay,
             process_group=parallel_state.get_data_parallel_group(),
-            dtype=torch.float16,
+            dtype=torch.bfloat16,
             # TODO distribute over DP group?
             # distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
             # redundant_process_group=parallel_state.get_data_parallel_group(),
@@ -92,16 +94,22 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
         )
         optimizer.init_param_buffer()
     else:
+        if world_size > 1:
+            raise ValueError("Can't use non-distributed Adam with multiple nodes.")
         optimizer = FusedAdam(
             models[0].parameters(),
             lr=lr,
             weight_decay=weight_decay
         )
     
-    wandb.init(
+    run = wandb.init(
         mode="offline",
         project="nanopar"
     )
+    artifact = wandb.Artifact(name="dpod-model", type="model")
+    os.makedirs(save_dir, exist_ok=True)
+    artifact.add_dir(local_path=save_dir)
+    run.log_artifact(artifact)
 
     total_loss = 0
     for i, sample in enumerate(bar := tqdm(dl)):
@@ -125,6 +133,18 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
             wandb.log(dict(loss=total_loss))
             bar.set_postfix(loss=total_loss)
             total_loss = 0
+        if i % save_every == 0:
+            # surely we won't be doing MP over more than 100 nodes
+            if parallel_state.get_data_parallel_rank() == 0:
+                mp_rank = torch.distributed.get_rank(group=parallel_state.get_model_parallel_group())
+                print(f"Saving at step {i}, rank {mp_rank}")
+                to_save = {
+                    "model": models[0].state_dict(),
+                    "optimizer": optimizer.state_dict()
+                }
+                torch.save(to_save, os.path.join(save_dir, f"save.{mp_rank:02d}.pt"))
+                print(f"Rank {mp_rank} saved")
+            torch.distributed.barrier()
 
 
 if __name__ == "__main__":

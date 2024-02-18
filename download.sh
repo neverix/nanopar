@@ -11,6 +11,7 @@ cd ..
 GIT_LFS_SKIP_SMUDGE=1 git clone  https://huggingface.co/meta-llama/Llama-2-7b llama-2-7b --depth=1
 cd llama-2-7b
 python ../../download.py meta-llama/Llama-2-7b
+echo '{"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-05, "vocab_size": 32000}' > params.json
 cd ..
 
 git clone https://huggingface.co/EleutherAI/pythia-160m-deduped pythia --depth=1

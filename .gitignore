@@ -163,6 +163,7 @@ cython_debug/
 model_dir/
 tokenizer.model
 sampling_tests.ipynb
+save_dir/
 
 # Ignore data
 data/

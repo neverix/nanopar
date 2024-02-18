@@ -52,15 +52,16 @@ MODEL_TYPE = os.environ.get("MODEL_TYPE") or "neox"
     *((llama_model_provider, ModelArgs) if MODEL_TYPE == "llama" else (neox_model_provider, NeoXArgs))
 )
 def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logprob"),
-         test_inference: bool = False):
+         test_inference: bool = False,
+         global_batch_size = 32,
+         micro_batch_size = 32,
+         seq_len = 2049
+         ):
     rank, local_rank, data_parallel_size, model_args, model_dir, use_sp, wrap_with_ddp, forward_backward_func = [
         kwargs[k] for k in
         ["rank", "local_rank", "data_parallel_size", "model_args", "model_dir", "use_sp", "wrap_with_ddp", "forward_backward_func"]]
-    
-    global_batch_size = 32
-    micro_batch_size = 32
+
     batch_size = global_batch_size // data_parallel_size
-    seq_len = 17  # 2049
     hidden = model_args.hidden_size if MODEL_TYPE == "neox" else model_args.dim
     
     setup_microbatch_calculator(
