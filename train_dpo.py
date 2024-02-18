@@ -77,7 +77,7 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
     # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
     batch_size = global_batch_size // data_parallel_size
 
-    dataset = StreamingDataset(local=f"local/dpo{rank}", remote=data_dir, shuffle=True)
+    dataset = StreamingDataset(local=data_dir, shuffle=True)
     dl = torch.utils.data.DataLoader(dataset, shuffle=False, batch_size=batch_size)
 
     if distributed_adam:
@@ -134,16 +134,17 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
             bar.set_postfix(loss=total_loss)
             total_loss = 0
         if i % save_every == 0:
-            # surely we won't be doing MP over more than 100 nodes
+            torch.distributed.barrier()
             if parallel_state.get_data_parallel_rank() == 0:
                 mp_rank = torch.distributed.get_rank(group=parallel_state.get_model_parallel_group())
-                print(f"Saving at step {i}, rank {mp_rank}")
+                print(f"Saving at step {i}, rank {rank}")
                 to_save = {
                     "model": models[0].state_dict(),
                     "optimizer": optimizer.state_dict()
                 }
+                # surely we won't be doing MP over more than 100 nodes
                 torch.save(to_save, os.path.join(save_dir, f"save.{mp_rank:02d}.pt"))
-                print(f"Rank {mp_rank} saved")
+                print(f"Rank {rank} saved")
             torch.distributed.barrier()
 
 
