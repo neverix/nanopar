@@ -106,10 +106,10 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
         mode="offline",
         project="nanopar"
     )
-    artifact = wandb.Artifact(name="dpod-model", type="model")
-    os.makedirs(save_dir, exist_ok=True)
-    artifact.add_dir(local_path=save_dir)
-    run.log_artifact(artifact)
+    # artifact = wandb.Artifact(name="dpod-model", type="model")
+    # os.makedirs(save_dir, exist_ok=True)
+    # artifact.add_dir(local_path=save_dir)
+    # run.log_artifact(artifact)
 
     total_loss = 0
     for i, sample in enumerate(bar := tqdm(dl)):

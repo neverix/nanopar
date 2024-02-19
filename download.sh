@@ -2,6 +2,12 @@
 mkdir model_dir
 cd model_dir
 
+GIT_LFS_SKIP_SMUDGE=1 git clone  https://huggingface.co/meta-llama/Llama-2-70b llama-2-70b --depth=1
+cd llama-2-70b
+python ../../download.py meta-llama/Llama-2-70b
+echo '{"dim": 8192, "multiple_of": 4096, "ffn_dim_multiplier": 1.3, "n_heads": 64, "n_kv_heads": 8, "n_layers": 80, "norm_eps": 1e-05, "vocab_size": 32000}' > params.json
+cd ..
+
 GIT_LFS_SKIP_SMUDGE=1 git clone  https://huggingface.co/meta-llama/Llama-2-13b llama-2-13b --depth=1
 cd llama-2-13b
 python ../../download.py meta-llama/Llama-2-13b
