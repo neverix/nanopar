@@ -11,6 +11,7 @@ from typing import Optional
 from pathlib import Path
 import random
 import json
+import gc
 import os
 
 
@@ -128,11 +129,19 @@ def main_with_model(model_provider, model_args_cls):
             set_random_seed(seed)
         
             model_args.use_sp = use_sp
+            # import subprocess
+            # if local_rank == 0:
+            #     print(subprocess.check_output("nvidia-smi").decode("utf-8"), flush=True)
             models = build_model(model_provider,
                         wrap_with_ddp,
                         virtual_pipeline_model_parallel_size,
                         args=model_args)
-            torch.cuda.empty_cache()  # frees ~9GB
+            # if local_rank == 0:
+            #     print(subprocess.check_output("nvidia-smi").decode("utf-8"), flush=True)
+            gc.collect()
+            torch.cuda.empty_cache()  # frees ~a lot GB
+            # if local_rank == 0:
+            #     print(subprocess.check_output("nvidia-smi").decode("utf-8"), flush=True)
         
             main_fn(models, dict(
                 rank=rank,
@@ -174,14 +183,18 @@ def parallel_dimension_llama(key):
 
 def load_consolidated_llama_weights(models, path: Path, wrap_with_ddp: bool):
     state_dict = LlamaConsolidatedLoader(path)
-    state_dict = {f"{'module.' if wrap_with_ddp else ''}wrapped." + k: v for k, v in state_dict.items()}
-    state_dict = {k: state_dict[k] for k in models[0].state_dict().keys()}
-    state_dict = {k: convert_weight_for_tp(v, parallel_dimension_llama(k))
-                  for k, v in state_dict.items()}
-    missing_keys, unexpected_keys = models[0].load_state_dict(state_dict)
+    state_dict = {
+        f"{'module.' if wrap_with_ddp else ''}wrapped." + k:
+        convert_weight_for_tp(v, parallel_dimension_llama(k))
+        for k, v in state_dict.items()}
+    missing_keys, unexpected_keys = models[0].load_state_dict(state_dict, strict=False)
+    # if int(os.environ["RANK"]) % torch.cuda.device_count():
+    #     print("Self:", list(models[0].state_dict().keys())[::100])
+    #     print("Other:", list(state_dict.keys())[::100])
+    #     print("Missing keys:", missing_keys[::50])
+    #     print("Unexpected keys:", unexpected_keys[::50])
     del state_dict
-    # print("Missing keys:", missing_keys)
-    # print("Unexpected keys:", unexpected_keys)
+    torch.cuda.empty_cache()
 
 def parallel_dimension_neox(key):
     if key.endswith("dense_4h_to_h.weight") or key.endswith("dense.weight"):

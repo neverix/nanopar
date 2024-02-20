@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 from apex.transformer.pipeline_parallel.utils import setup_microbatch_calculator
 from apex.transformer import tensor_parallel
 
+import streaming
 from streaming import StreamingDataset, MDSWriter
 from tqdm.auto import tqdm, trange
 import torch
@@ -31,7 +32,7 @@ def loss_fn(pred, batch):
 
 
 def cache_logprob(batch, model):
-    inputs = batch.view(-1, batch.shape[-1])[:, :-1].clone()
+    inputs = batch.view(-1, batch.shape[-1])[:, :-1].contiguous()
     inputs[inputs < 0] = 0
     pred = model(inputs)
     return pred, (lambda pred: (0, {"logprobs": loss_fn(pred, batch)}))
@@ -72,6 +73,7 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
         data_parallel_size=data_parallel_size,
     )
     
+    print(rank, "loading weights", flush=True)
     if MODEL_TYPE == "llama":
         load_consolidated_llama_weights(models, model_dir / "consolidated.00.pth", wrap_with_ddp)
     else:
@@ -79,53 +81,78 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
     
     # https://github.com/mosaicml/streaming/blob/release/v0.7.1/streaming/multimodal/convert/webvid/extract_webvid_videos.py
     # no special utility for processing StreamingDatasets
-    dataset = StreamingDataset(local="local/logprob", remote=input_dir, shuffle=False)
+    print(rank, "ds", flush=True)
+    dataset = StreamingDataset(local=input_dir, shuffle=False)
+    print(rank, "dlc", flush=True)
     dl = torch.utils.data.DataLoader(dataset, shuffle=False, batch_size=batch_size)
+    print(rank, "cleaning", flush=True)
+    streaming.base.util.clean_stale_shared_memory()
+    print(rank, "iterstart", flush=True)
+    next(iter(dl))
+    print(rank, "iterend", flush=True)
     
     shutil.rmtree(output_dir, ignore_errors=True)
-    with MDSWriter(out=str(output_dir), columns={"tokens": "ndarray", "logprobs": "ndarray"}, compression="zstd") as out:
-        for batch in tqdm(dl):
-            tokens = batch["tokens"]
-            tokens = tokens[..., -seq_len:].cuda()
-            if test_inference:
-                if MODEL_TYPE == "neox":
-                    tokenizer = AutoTokenizer.from_pretrained(model_dir)
-                    decode = lambda x: [tokenizer.decode([u for u in y if u >= 0]) for y in x]
-                    tokens[..., 0] = tokenizer.encode("The")[0]  # BOS
-                else:
-                    tokenizer = SentencePieceProcessor(str(model_dir / "tokenizer.model"))
-                    tokens[..., 0] = tokenizer.Encode("The")[0]
-                    decode = lambda x: tokenizer.Decode(x)
-                inference(
-                    local_rank=local_rank,
-                    batch=tokens,
-                    models=models,
-                    forward_backward_func=forward_backward_func,
-                    micro_batch_size=micro_batch_size,
-                    decode=decode,
-                    use_sp=use_sp,
-                    vocab_size=model_args.vocab_size,
-                    hidden_dim=hidden
-                )
-                return
-            logprobs = forward_backward_func(
-                cache_logprob,
-                tokens,
-                models,
-                forward_only=True,
-                # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
-                tensor_shape=(seq_len - 1, micro_batch_size, hidden),
-                dtype=torch.bfloat16,
-                async_comm=True,
-                sync_batch_comm=False,
-                sequence_parallel_enabled=use_sp,
-            )[0]["logprobs"]
+    os.makedirs(output_dir, exist_ok=True)
+    out = None
+    is_writer = parallel_state.is_pipeline_last_stage() and parallel_state.get_tensor_model_parallel_rank() == 0
+    print(rank, "making writer", flush=True)
+    if is_writer:
+        out = MDSWriter(out=str(output_dir), columns={"tokens": "ndarray", "logprobs": "ndarray"}, compression="zstd")
+    print(rank, "made writer", flush=True)
+    torch.distributed.barrier()
+    print(rank, "after writer", flush=True)
+    for batch in (tqdm if is_writer else lambda x: x)(dl):
+        print(rank, "aaaaaaaa", flush=True)
+        tokens = batch["tokens"]
+        tokens = tokens[..., -seq_len:].cuda()
+        if test_inference:
+            if MODEL_TYPE == "neox":
+                tokenizer = AutoTokenizer.from_pretrained(model_dir)
+                decode = lambda x: [tokenizer.decode([u for u in y if u >= 0]) for y in x]
+                tokens[..., 0] = tokenizer.encode("The")[0]  # BOS
+            else:
+                tokenizer = SentencePieceProcessor(str(model_dir / "tokenizer.model"))
+                tokens[..., 0] = tokenizer.Encode("The")[0]
+                decode = lambda x: tokenizer.Decode(x)
+            inference(
+                local_rank=local_rank,
+                batch=tokens,
+                models=models,
+                forward_backward_func=forward_backward_func,
+                micro_batch_size=micro_batch_size,
+                decode=decode,
+                use_sp=use_sp,
+                vocab_size=model_args.vocab_size,
+                hidden_dim=hidden
+            )
+            return
+        print(rank, "Computing", flush=True)
+        
+        result = forward_backward_func(
+            cache_logprob,
+            tokens,
+            models,
+            forward_only=True,
+            # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
+            tensor_shape=(seq_len - 1, micro_batch_size, hidden),
+            dtype=torch.bfloat16,
+            async_comm=False,
+            sync_batch_comm=True,
+            sequence_parallel_enabled=use_sp,
+        )
+        print(rank, "Computed", flush=True)
+        
+        if is_writer:
+            logprobs = result[0]["logprobs"]
             # singular, but they are a size-2 batch of sequences.
             for token, logprob in zip(tokens, logprobs):
                 out.write({
                     "tokens": token.detach().cpu().numpy(),
                     "logprobs": logprob.detach().cpu().numpy(),
                 })
+        print(rank, "before", flush=True)
+        torch.distributed.barrier()
+        print(rank, "after", flush=True)
 
 
 def inference(models, forward_backward_func, batch, decode, vocab_size, hidden_dim,

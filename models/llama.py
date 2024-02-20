@@ -412,7 +412,7 @@ class PipelineStage(nn.Module):
             inputs = x
         else:
             inputs = self.input_tensors
-        return self.wrapped(*inputs, **kwargs)
+        return self.wrapped(*inputs, **kwargs).contiguous()
 
 
 def llama_model_provider(args, **_):

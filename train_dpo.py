@@ -77,7 +77,7 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
     # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
     batch_size = global_batch_size // data_parallel_size
 
-    dataset = StreamingDataset(local=data_dir, shuffle=True)
+    dataset = StreamingDataset(local=data_dir, shuffle=False)
     dl = torch.utils.data.DataLoader(dataset, shuffle=False, batch_size=batch_size)
 
     if distributed_adam:
@@ -87,10 +87,10 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
             weight_decay=weight_decay,
             process_group=parallel_state.get_data_parallel_group(),
             dtype=torch.bfloat16,
-            # TODO distribute over DP group?
-            # distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
-            # redundant_process_group=parallel_state.get_data_parallel_group(),
             store_params=False,
+            # TODO distribute over DP group?
+            distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
+            redundant_process_group=parallel_state.get_data_parallel_group(),
         )
         optimizer.init_param_buffer()
     else:
