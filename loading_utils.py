@@ -9,10 +9,73 @@ import torch
 
 from typing import Optional
 from pathlib import Path
+from copy import copy
 import random
 import json
 import gc
 import os
+
+
+LLAMA_KEY_TO_DIM = {
+    "w1": 0,
+    "w2": 1,
+    "w3": 0,
+    "wo": 1,
+    "wq": 0,
+    "wk": 0,
+    "wv": 0,
+    "output": 0,
+    "tok_embeddings": 1,
+    "ffn_norm": None,
+    "attention_norm": None,
+    "norm": None,
+    "rope": None,
+}
+
+class MultiFileTensor(object):
+    def __init__(self, files, parameter_name, dim):
+        self.files = files
+        self.name = parameter_name
+        self.dim = dim
+        self.length = self.files[0][parameter_name].shape[dim] * len(self.files)
+        self.is_leading = dim == 0
+    
+    def restore(self):
+        return self.transpose(0, self.dim)[0:self.length].transpose(0, self.dim)
+    
+    def transpose(self, a1, a2):
+        if a1 != 0:
+            raise ValueError(f"Can only swap leading dimension: expected (0,{self.dim}), got ({a1},{a2})")
+        if a2 != self.dim:
+            return self.restore().transpose(a1, a2)
+        cp = copy(self)  # shallow
+        cp.is_leading = self.dim == 0 or not cp.is_leading
+        return cp
+    
+    @property
+    def shape(self):
+        if self.is_leading:
+            return (self.length,)  # 🏏🫳
+        zero_shape = self.files[0][self.name].shape
+        assert zero_shape[self.dim] * len(self.files) == self.length
+        zero_shape = zero_shape[:self.dim] + (self.length,) + zero_shape[self.dim + 1:]
+        return zero_shape
+    
+    def __getitem__(self, sl):
+        if (not isinstance(sl, slice)) or (not self.is_leading):
+            raise ValueError("Can only slice on leading axis")
+        a, b = sl.start, sl.stop
+        chunk = (self.length // len(self.files))
+        f0, f1 = a // chunk, (b - 1 + chunk) // chunk
+        tensors = []
+        for f in range(f0, f1):
+            f_a, f_b = f * chunk, (f + 1) * chunk
+            x, y = max(f_a, a), min(f_b, b)
+            tensor = self.files[f][self.name]
+            tensor = tensor.transpose(0, self.dim)
+            tensor = tensor[x - f * chunk : y - f * chunk]
+            tensors.append(tensor)
+        return torch.cat(tensors, 0)
 
 
 class LlamaConsolidatedLoader(dict):
@@ -26,30 +89,11 @@ class LlamaConsolidatedLoader(dict):
             self.files.append(torch.load(f"{prefix}.{i:02d}.pth", mmap=True, map_location=None if torch.cuda.device_count() > 1 else "cuda:0"))
 
     def __getitem__(self, parameter_name):
-        tensors = []
-        for f in self.files:
-            if parameter_name in f:
-                tensors.append(f[parameter_name])
-        key_to_dim = {
-            "w1": 0,
-            "w2": -1,
-            "w3": 0,
-            "wo": -1,
-            "wq": 0,
-            "wk": 0,
-            "wv": 0,
-            "output": 0,
-            "tok_embeddings": -1,
-            "ffn_norm": None,
-            "attention_norm": None,
-            "norm": None,
-            "rope": None,
-        }
         short_name = parameter_name.split(".")[-2]
-        dim = key_to_dim[short_name]
+        dim = LLAMA_KEY_TO_DIM[short_name]
         if dim is None:
-            return tensors[0]
-        return torch.cat(tensors, dim)
+            return self.files[0][parameter_name]
+        return MultiFileTensor(self.files, parameter_name, dim)
     
     def items(self):
         all_keys = set(k for file in self.files for k in file.keys())
@@ -166,20 +210,16 @@ def convert_weight_for_tp(weight, parallel_dimension):
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     tp_size = parallel_state.get_tensor_model_parallel_world_size()
     chunk_size = weight.shape[parallel_dimension] // tp_size
-    return weight.transpose(parallel_dimension, 0)[
+    return weight.transpose(0, parallel_dimension)[
         chunk_size*tp_rank:chunk_size*(tp_rank+1)
     ].transpose(0, parallel_dimension)
 
 def parallel_dimension_llama(key):
-    if key.endswith("w2.weight") or key.endswith("wo.weight"):
-        # row parallel
-        return 1
-    elif (key.endswith("w1.weight") or key.endswith("w3.weight")
-         or key.endswith("wq.weight") or key.endswith("wk.weight") or key.endswith("wv.weight")
-         or key.endswith("output.weight") or key.endswith("tok_embeddings.weight")):
-        return 0
-    else:
-        return None
+    short_name = key.split(".")[-2]
+    if short_name == "tok_embeddings":
+        return 0  # LLaMA uses a different sharding from tiny/nanopar
+    dim = LLAMA_KEY_TO_DIM[short_name]
+    return dim
 
 def load_consolidated_llama_weights(models, path: Path, wrap_with_ddp: bool):
     state_dict = LlamaConsolidatedLoader(path)

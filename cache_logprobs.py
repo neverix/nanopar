@@ -73,7 +73,6 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
         data_parallel_size=data_parallel_size,
     )
     
-    print(rank, "loading weights", flush=True)
     if MODEL_TYPE == "llama":
         load_consolidated_llama_weights(models, model_dir / "consolidated.00.pth", wrap_with_ddp)
     else:
@@ -81,28 +80,19 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
     
     # https://github.com/mosaicml/streaming/blob/release/v0.7.1/streaming/multimodal/convert/webvid/extract_webvid_videos.py
     # no special utility for processing StreamingDatasets
-    print(rank, "ds", flush=True)
     dataset = StreamingDataset(local=input_dir, shuffle=False)
-    print(rank, "dlc", flush=True)
     dl = torch.utils.data.DataLoader(dataset, shuffle=False, batch_size=batch_size)
-    print(rank, "cleaning", flush=True)
     streaming.base.util.clean_stale_shared_memory()
-    print(rank, "iterstart", flush=True)
     next(iter(dl))
-    print(rank, "iterend", flush=True)
     
     shutil.rmtree(output_dir, ignore_errors=True)
     os.makedirs(output_dir, exist_ok=True)
     out = None
     is_writer = parallel_state.is_pipeline_last_stage() and parallel_state.get_tensor_model_parallel_rank() == 0
-    print(rank, "making writer", flush=True)
     if is_writer:
         out = MDSWriter(out=str(output_dir), columns={"tokens": "ndarray", "logprobs": "ndarray"}, compression="zstd")
-    print(rank, "made writer", flush=True)
     torch.distributed.barrier()
-    print(rank, "after writer", flush=True)
     for batch in (tqdm if is_writer else lambda x: x)(dl):
-        print(rank, "aaaaaaaa", flush=True)
         tokens = batch["tokens"]
         tokens = tokens[..., -seq_len:].cuda()
         if test_inference:
@@ -126,7 +116,6 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
                 hidden_dim=hidden
             )
             return
-        print(rank, "Computing", flush=True)
         
         result = forward_backward_func(
             cache_logprob,
@@ -140,7 +129,6 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
             sync_batch_comm=True,
             sequence_parallel_enabled=use_sp,
         )
-        print(rank, "Computed", flush=True)
         
         if is_writer:
             logprobs = result[0]["logprobs"]
@@ -150,9 +138,9 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
                     "tokens": token.detach().cpu().numpy(),
                     "logprobs": logprob.detach().cpu().numpy(),
                 })
-        print(rank, "before", flush=True)
         torch.distributed.barrier()
-        print(rank, "after", flush=True)
+    if is_writer:
+        out.finish()
 
 
 def inference(models, forward_backward_func, batch, decode, vocab_size, hidden_dim,
