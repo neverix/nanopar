@@ -56,7 +56,8 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
          test_inference: bool = False,
          global_batch_size = 32,
          micro_batch_size = 32,
-         seq_len = 2049
+         seq_len = 2049,
+         compare_to_fb_llama: bool = False
          ):
     rank, local_rank, data_parallel_size, model_args, model_dir, use_sp, wrap_with_ddp, forward_backward_func = [
         kwargs[k] for k in
@@ -77,6 +78,19 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
         load_consolidated_llama_weights(models, model_dir / "consolidated.00.pth", wrap_with_ddp)
     else:
         load_consolidated_neox_weights(models, model_args, model_dir / "pytorch_model.bin", wrap_with_ddp)
+    
+    compare_to_fb_llama = compare_to_fb_llama and parallel_state.is_pipeline_last_stage()
+    if compare_to_fb_llama:
+        assert MODEL_TYPE == "llama"
+        from llama import Transformer
+        from fairscale.nn.model_parallel.initialize import initialize_model_parallel
+        from loading_utils import convert_weight_for_tp, LLAMA_KEY_TO_DIM
+        initialize_model_parallel(parallel_state.get_tensor_model_parallel_world_size())
+        llama = Transformer(model_args).half().cuda()
+        llama.load_state_dict(
+            {k: convert_weight_for_tp(v, LLAMA_KEY_TO_DIM[k.split(".")[-2]])
+            for k, v in torch.load(str(model_dir / "consolidated.00.pth"), mmap=True).items()},
+            strict=False)
     
     # https://github.com/mosaicml/streaming/blob/release/v0.7.1/streaming/multimodal/convert/webvid/extract_webvid_videos.py
     # no special utility for processing StreamingDatasets
@@ -130,8 +144,21 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
             sequence_parallel_enabled=use_sp,
         )
         
+        if compare_to_fb_llama:
+            # hack
+            inputs = tokens.view(-1, tokens.shape[-1])[:, :-1].contiguous()
+            inputs[inputs < 0] = 0
+            pred = llama(inputs, start_pos=0)
+            targets = tokens.view(-1, tokens.shape[-1])[:, 1:].contiguous().long()
+            llama_logprobs = torch.nn.functional.cross_entropy(
+                pred.transpose(1, -1), targets, reduction="none").sum(1)
+        
         if is_writer:
             logprobs = result[0]["logprobs"]
+            if compare_to_fb_llama:
+                llama_logprobs = llama_logprobs.view(logprobs.shape)
+                logprob_diff = logprobs - llama_logprobs
+                print("Logprob difference:", logprob_diff.pow(2).mean(), flush=True)
             # singular, but they are a size-2 batch of sequences.
             for token, logprob in zip(tokens, logprobs):
                 out.write({

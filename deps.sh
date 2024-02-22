@@ -22,4 +22,3 @@ python -m pip install .                   # Build and install
 cd ..
 
 python -m pip install -q mosaicml-streaming sentencepiece pandas pyarrow fire wandb einops
-pip install -q https://github.com/facebookresearch/llama
