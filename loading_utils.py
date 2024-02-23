@@ -204,11 +204,13 @@ def main_with_model(model_provider, model_args_cls):
     return decorator
 
 
-def convert_weight_for_tp(weight, parallel_dimension):
+def convert_weight_for_tp(weight, parallel_dimension, tp_rank=None, tp_size=None):
     if parallel_dimension is None:
         return weight
-    tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    if tp_rank is None:
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    if tp_size is None:
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
     chunk_size = weight.shape[parallel_dimension] // tp_size
     return weight.transpose(0, parallel_dimension)[
         chunk_size*tp_rank:chunk_size*(tp_rank+1)
