@@ -108,11 +108,18 @@ def main_nanopar(models, kwargs, *, tokens=None):
         sync_batch_comm=True,
         sequence_parallel_enabled=use_sp,
     )
+    pred = result[0].get("pred", None)
+    if pred is None:
+        return
+    preds = torch.empty((pred.shape[0] * parallel_state.get_tensor_model_parallel_world_size(), *pred.shape[1:]),
+                        dtype=pred.dtype, device=pred.device)
+    torch.distributed.all_gather_into_tensor(preds, pred, parallel_state.get_tensor_model_parallel_group())
+    pred = preds
 
     is_writer = parallel_state.is_pipeline_last_stage() and parallel_state.get_tensor_model_parallel_rank() == 0
     torch.distributed.barrier()
     if is_writer:
-        return result[0]["pred"]
+        return pred
 
 
 def main(verification_dir = "verification", verify_text = "Hello world! This is a test.", **kwargs):
