@@ -44,7 +44,7 @@ def cache_logprob(batch, model):
     return pred, (lambda pred: (0, {"pred": pred}))
 
 
-def main_llama(model_dir: str, params_file: str):
+def main_llama(model_dir: str, params_file: str, *, tokens=None):
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group("nccl")
     model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -53,6 +53,7 @@ def main_llama(model_dir: str, params_file: str):
     
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
+    tokens = tokens.cuda()
     
     loaded_args = json.load(open(Path(model_dir) / params_file, "r"))
     model_args = ModelArgs(
@@ -71,14 +72,15 @@ def main_llama(model_dir: str, params_file: str):
     inputs = tokens.view(-1, tokens.shape[-1])[:, :-1].contiguous()
     inputs[inputs < 0] = 0
     pred = llama(inputs, start_pos=0)
-    targets = tokens.view(-1, tokens.shape[-1])[:, 1:].contiguous().long()
-    llama_logprobs = torch.nn.functional.cross_entropy(
-        pred.transpose(1, -1), targets, reduction="none").sum(1).view(tokens.shape[:-1])
-    print(llama_logprobs)
+    print(pred)
+    # targets = tokens.view(-1, tokens.shape[-1])[:, 1:].contiguous().long()
+    # llama_logprobs = torch.nn.functional.cross_entropy(
+    #     pred.transpose(1, -1), targets, reduction="none").sum(1).view(tokens.shape[:-1])
+    # print(llama_logprobs)
 
 
 @main_with_model(llama_model_provider, ModelArgs)
-def main_nanopar(models, kwargs):
+def main_nanopar(models, kwargs, *, tokens=None):
     rank, local_rank, data_parallel_size, model_args, model_dir, use_sp, wrap_with_ddp, forward_backward_func = [
         kwargs[k] for k in
         ["rank", "local_rank", "data_parallel_size", "model_args", "model_dir", "use_sp", "wrap_with_ddp", "forward_backward_func"]]
@@ -99,7 +101,7 @@ def main_nanopar(models, kwargs):
 
     result = forward_backward_func(
         cache_logprob,
-        tokens,
+        tokens.cuda(),
         models,
         forward_only=True,
         # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
@@ -110,9 +112,10 @@ def main_nanopar(models, kwargs):
         sequence_parallel_enabled=use_sp,
     )
 
+    is_writer = parallel_state.is_pipeline_last_stage() and parallel_state.get_tensor_model_parallel_rank() == 0
     if is_writer:
-        logprobs = result[0]["logprobs"]
-        print(logprobs)
+        pred = result[0]["pred"]
+        print(pred)
     torch.distributed.barrier()
 
 
@@ -121,6 +124,6 @@ if __name__ == "__main__":
     tokens = tokenizer.Encode("Hello world! This is a test.")
     tokens = torch.LongTensor(tokens).unsqueeze(0)
     if os.environ.get("MODEL_TYPE", "nanopar") == "nanopar":
-        fire.Fire(main_nanopar)
+        fire.Fire(partial(main_nanopar, tokens=tokens))
     else:
-        fire.Fire(main_llama)
+        fire.Fire(partial(main_llama, tokens=tokens))
