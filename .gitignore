@@ -162,8 +162,8 @@ cython_debug/
 # Ignore weights
 model_dir/
 tokenizer.model
-sampling_tests.ipynb
 save_dir/
+verification/
 
 # Ignore data
 data/

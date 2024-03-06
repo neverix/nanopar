@@ -72,11 +72,8 @@ def main_llama(model_dir: str, params_file: str, *, tokens=None):
     inputs = tokens.view(-1, tokens.shape[-1])[:, :-1].contiguous()
     inputs[inputs < 0] = 0
     pred = llama(inputs, start_pos=0)
-    print(pred)
-    # targets = tokens.view(-1, tokens.shape[-1])[:, 1:].contiguous().long()
-    # llama_logprobs = torch.nn.functional.cross_entropy(
-    #     pred.transpose(1, -1), targets, reduction="none").sum(1).view(tokens.shape[:-1])
-    # print(llama_logprobs)
+    if local_rank == 0:
+        return pred
 
 
 @main_with_model(llama_model_provider, ModelArgs)
@@ -113,17 +110,40 @@ def main_nanopar(models, kwargs, *, tokens=None):
     )
 
     is_writer = parallel_state.is_pipeline_last_stage() and parallel_state.get_tensor_model_parallel_rank() == 0
-    if is_writer:
-        pred = result[0]["pred"]
-        print(pred)
     torch.distributed.barrier()
+    if is_writer:
+        return result[0]["pred"]
+
+
+def main(verification_dir = "verification", verify_text = "Hello world! This is a test.", **kwargs):
+    tokenizer = SentencePieceProcessor("model_dir/llama-2-7b/tokenizer.model")
+    tokens = tokenizer.Encode(verify_text)
+    tokens = torch.LongTensor(tokens).unsqueeze(0)
+    model_type = os.environ.get("MODEL_TYPE", "nanopar")
+    print("Verifying text", repr(verify_text), "on model", model_type)
+    if model_type == "nanopar":
+        pred = partial(main_nanopar, tokens=tokens)(**kwargs)
+    elif model_type == "llama":
+        pred = partial(main_llama, tokens=tokens)(**kwargs)
+    else:
+        print("???")
+        print("Define MODEL_TYPE={nanopar,llama} environment variable please")
+        exit(1)
+    os.makedirs(verification_dir, exist_ok=True)
+    if pred is None:
+        return
+    print("Got prediction.")
+    fn = f"{model_type}.th"
+    for other_fn in os.listdir(verification_dir):
+        if other_fn == fn:
+            continue
+        other_pred = torch.load(os.path.join(verification_dir, other_fn))
+        diff = (other_pred.ravel() - pred.ravel()).sort().values
+        print("Difference to", other_fn, diff[::len(diff) // 16])
+        print("Quantiles self", pred.ravel().sort().values[::pred.numel() // 16])
+        print("Quantiles other", other_pred.ravel().sort().values[::other_pred.numel() // 16])
+    torch.save(pred, os.path.join(verification_dir, fn))
 
 
 if __name__ == "__main__":
-    tokenizer = SentencePieceProcessor("model_dir/llama-2-7b/tokenizer.model")
-    tokens = tokenizer.Encode("Hello world! This is a test.")
-    tokens = torch.LongTensor(tokens).unsqueeze(0)
-    if os.environ.get("MODEL_TYPE", "nanopar") == "nanopar":
-        fire.Fire(partial(main_nanopar, tokens=tokens))
-    else:
-        fire.Fire(partial(main_llama, tokens=tokens))
+    fire.Fire(main)

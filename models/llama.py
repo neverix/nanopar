@@ -345,9 +345,9 @@ class Transformer(nn.Module):
             self.layers[str(layer_id)] = EncoderBlock(args, dtype, use_sp=use_sp)
 
         if self.pp_rank == self.pp_world - 1:
-            self.norm = RMSNorm(args.dim, eps=args.norm_eps, dtype=dtype, use_sp=use_sp)
+            self.norm = RMSNorm(args.dim, eps=args.norm_eps, dtype=torch.float32, use_sp=use_sp)
             self.output = ColumnParallelLinear(
-                args.dim, self.vocab_size, dtype=dtype, use_sp=use_sp)
+                args.dim, self.vocab_size, dtype=torch.float32, use_sp=use_sp)
 
         self.freqs_complex = precompute_theta_pos_frequencies(self.args.dim // self.args.n_heads,
                                                               self.args.max_seq_len * 2
@@ -389,8 +389,8 @@ class Transformer(nn.Module):
             h = layer(h, start_pos, freqs_complex,
                       kv_cache=cache)
         if self.pp_rank == self.pp_world - 1:
-            h = self.norm(h)
-            output = self.output(h).float()
+            h = self.norm(h.float())
+            output = self.output(h)
         else:
             output = h
         return output

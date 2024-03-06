@@ -187,7 +187,7 @@ def main_with_model(model_provider, model_args_cls):
             # if local_rank == 0:
             #     print(subprocess.check_output("nvidia-smi").decode("utf-8"), flush=True)
         
-            main_fn(models, dict(
+            return main_fn(models, dict(
                 rank=rank,
                 local_rank=local_rank,
                 data_parallel_size=data_parallel_size,
