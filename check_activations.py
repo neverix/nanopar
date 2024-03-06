@@ -27,16 +27,6 @@ from fairscale.nn.model_parallel.initialize import (
 from loading_utils import convert_weight_for_tp, LLAMA_KEY_TO_DIM
 
 
-def loss_fn(pred, batch):
-    targets = batch.view(-1, batch.shape[-1])[:, 1:].transpose(0, 1).contiguous()
-    torch.distributed.barrier()  # target must be on GPU?
-    losses = tensor_parallel.vocab_parallel_cross_entropy(pred, targets)
-    mask = targets >= 0
-    losses = losses * mask
-    losses = losses.sum(0).reshape(batch.shape[:-1])
-    return losses
-
-
 def cache_logprob(batch, model):
     inputs = batch.view(-1, batch.shape[-1])[:, :-1].contiguous()
     inputs[inputs < 0] = 0
