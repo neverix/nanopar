@@ -7,6 +7,7 @@ from apex.transformer import parallel_state, tensor_parallel
 import numpy as np
 import torch
 
+from contextlib import nullcontext
 from typing import Optional
 from pathlib import Path
 from copy import copy
@@ -128,6 +129,7 @@ def main_with_model(model_provider, model_args_cls):
                 
                 tensor_model_parallel_size = 1,
                 pipeline_model_parallel_size = 1,
+                use_te = False,
                 virtual_pipeline_model_parallel_size: Optional[int] = None,
                 use_sp=False,
                 wrap_with_ddp=False,
@@ -176,10 +178,18 @@ def main_with_model(model_provider, model_args_cls):
             # import subprocess
             # if local_rank == 0:
             #     print(subprocess.check_output("nvidia-smi").decode("utf-8"), flush=True)
-            models = build_model(model_provider,
-                        wrap_with_ddp,
-                        virtual_pipeline_model_parallel_size,
-                        args=model_args)
+            make_model_context = nullcontext
+            if use_te:
+                import transformer_engine
+                fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
+                    margin=0, interval=1, fp8_format=transformer_engine.common.recipe.Format.E4M3,
+                )
+                make_model_context = partial(transformer_engine.pytorch.fp8_model_init, enabled=True)
+            with make_model_context():
+                models = build_model(model_provider,
+                            wrap_with_ddp,
+                            virtual_pipeline_model_parallel_size,
+                            args=model_args)
             # if local_rank == 0:
             #     print(subprocess.check_output("nvidia-smi").decode("utf-8"), flush=True)
             gc.collect()

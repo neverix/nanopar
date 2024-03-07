@@ -18,6 +18,7 @@ import os
 
 
 # from https://gist.github.com/MFreidank/821cc87b012c53fade03b0c7aba13958
+# for when you're overfitting on a small sample
 class InfiniteDataLoader(torch.utils.data.DataLoader):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
