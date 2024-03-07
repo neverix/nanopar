@@ -61,9 +61,6 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
         kwargs[k] for k in
         ["rank", "data_parallel_size", "model_dir", "forward_backward_func", "use_sp", "wrap_with_ddp", "model_args", "world_size"]]
     
-    import subprocess
-    print("start", subprocess.check_output("nvidia-smi").decode("utf-8"))
-    
     setup_microbatch_calculator(
         rank=rank,
         rampup_batch_size=None,
@@ -76,9 +73,6 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
         load_consolidated_llama_weights(models, model_dir / "consolidated.00.pth", wrap_with_ddp)
     else:
         load_consolidated_neox_weights(models, model_args, model_dir / "pytorch_model.bin", wrap_with_ddp)
-
-    import subprocess
-    print("load", subprocess.check_output("nvidia-smi").decode("utf-8"))
 
     # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
     batch_size = global_batch_size // data_parallel_size
@@ -108,20 +102,19 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
             weight_decay=weight_decay
         )
     
-    import subprocess
-    print("optim", subprocess.check_output("nvidia-smi").decode("utf-8"))
-    
-    run = wandb.init(
-        mode="offline",
-        project="nanopar"
-    )
+    is_writer = parallel_state.is_pipeline_last_stage() and parallel_state.get_tensor_model_parallel_rank() == 0
+    if is_writer:
+        run = wandb.init(
+            mode="offline",
+            project="nanopar"
+        )
     # artifact = wandb.Artifact(name="dpod-model", type="model")
     # os.makedirs(save_dir, exist_ok=True)
     # artifact.add_dir(local_path=save_dir)
     # run.log_artifact(artifact)
 
     total_loss = 0
-    for i, sample in enumerate(bar := tqdm(dl)):
+    for i, sample in enumerate(bar := (tqdm(dl) if is_writer else dl)):
         torch.distributed.barrier()
         loss = forward_backward_func(
             train_step,
@@ -139,19 +132,20 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
             torch.nn.utils.clip_grad_norm_(models[0].parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
-            wandb.log(dict(loss=total_loss))
-            bar.set_postfix(loss=total_loss)
+            if is_writer:
+                wandb.log(dict(loss=total_loss))
+                bar.set_postfix(loss=total_loss)
             total_loss = 0
         if i % save_every == 0:
             torch.distributed.barrier()
             if parallel_state.get_data_parallel_rank() == 0:
                 mp_rank = torch.distributed.get_rank(group=parallel_state.get_model_parallel_group())
-                print(f"Saving at step {i}, rank {rank}")
                 to_save = {
                     "model": models[0].state_dict(),
                     "optimizer": optimizer.state_dict()
                 }
                 # surely we won't be doing MP over more than 100 nodes
+                os.makedirs(save_dir, exist_ok=True)
                 torch.save(to_save, os.path.join(save_dir, f"save.{mp_rank:02d}.pt"))
                 print(f"Rank {rank} saved")
             torch.distributed.barrier()
