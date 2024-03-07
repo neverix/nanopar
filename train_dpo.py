@@ -38,12 +38,12 @@ class InfiniteDataLoader(torch.utils.data.DataLoader):
 
 
 def loss_fn(pred, label, logprobs, beta=0.1):
-    losses = tensor_parallel.vocab_parallel_cross_entropy(pred.contiguous(), label.contiguous())
+    losses = tensor_parallel.vocab_parallel_cross_entropy(pred.contiguous().float(), label.contiguous())
     mask = label >= 0
     losses = (losses * mask).sum(0)
     losses = losses.view(-1, 2).transpose(0, 1)
     losses_chosen, losses_rejected = losses
-    logprobs_chosen, logprobs_rejected = logprobs.T
+    logprobs_chosen, logprobs_rejected = logprobs.float().T
     loss = -torch.nn.functional.logsigmoid(beta * ((losses_chosen - losses_rejected) - (logprobs_chosen - logprobs_rejected)))
     loss = loss.mean()
     return loss, {"loss": average_losses_across_data_parallel_group([loss])}
@@ -70,12 +70,12 @@ MODEL_TYPE = os.environ.get("MODEL_TYPE") or "neox"
 def main(models, kwargs, data_dir=Path("data/logprob"),
          grad_acc: int = 8,
          distributed_adam: bool = True,
-         lr: float = 1e-4,
+         lr: float = 1e-5,
          weight_decay: float = 1e-6,
          global_batch_size: int = 1,
          micro_batch_size: int = 1,
          save_dir = "./save_dir",
-         save_every: int = 100,
+         save_every: int = None,
          train_steps: int = 100
          ):
     rank, data_parallel_size, model_dir, forward_backward_func, use_sp, wrap_with_ddp, model_args, world_size = [
@@ -95,25 +95,22 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
     else:
         load_consolidated_neox_weights(models, model_args, model_dir / "pytorch_model.bin", wrap_with_ddp)
 
-    # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
-    batch_size = global_batch_size // data_parallel_size
-
-    dataset = StreamingDataset(local=data_dir, shuffle=False)
-    dl = InfiniteDataLoader(dataset, shuffle=False, batch_size=batch_size)
-
     if distributed_adam:
         optimizer = DistributedFusedAdam(
             models[0].parameters(),
             lr=lr,
             weight_decay=weight_decay,
             process_group=torch.distributed.distributed_c10d._get_default_group(),
-            dtype=torch.bfloat16,
             store_params=False,
             # TODO distribute over DP group?
             distributed_process_group=parallel_state.get_model_parallel_group(),
             redundant_process_group=parallel_state.get_data_parallel_group(),
         )
-        optimizer.init_param_buffer()
+        param_to_name = {v: k for k, v in models[0].named_parameters()}
+        np = optimizer.parameters()
+        optimizer.init_params([p for p in np if p.dtype == torch.float32], dtype=torch.float32)
+        optimizer.init_params([p for p in np if p.dtype != torch.float32], dtype=torch.bfloat16)
+        # optimizer.init_param_buffer()
     else:
         if world_size > 1:
             raise ValueError("Can't use non-distributed Adam with multiple nodes.")
@@ -122,6 +119,12 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
             lr=lr,
             weight_decay=weight_decay
         )
+
+    # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
+    batch_size = global_batch_size // data_parallel_size
+
+    dataset = StreamingDataset(local=data_dir, shuffle=False)
+    dl = InfiniteDataLoader(dataset, shuffle=False, batch_size=batch_size)
     
     is_writer = parallel_state.is_pipeline_last_stage() and parallel_state.get_tensor_model_parallel_rank() == 0
     if is_writer:
@@ -157,7 +160,7 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
                 wandb.log(dict(loss=total_loss))
                 bar.set_postfix(loss=total_loss)
             total_loss = 0
-        if i % save_every == 0:
+        if save_every is not None and i % save_every == 0:
             torch.distributed.barrier()
             if parallel_state.get_data_parallel_rank() == 0:
                 mp_rank = torch.distributed.get_rank(group=parallel_state.get_model_parallel_group())
