@@ -61,6 +61,9 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
         kwargs[k] for k in
         ["rank", "data_parallel_size", "model_dir", "forward_backward_func", "use_sp", "wrap_with_ddp", "model_args", "world_size"]]
     
+    import subprocess
+    print("start", subprocess.check_output("nvidia-smi").decode("utf-8"))
+    
     setup_microbatch_calculator(
         rank=rank,
         rampup_batch_size=None,
@@ -74,6 +77,9 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
     else:
         load_consolidated_neox_weights(models, model_args, model_dir / "pytorch_model.bin", wrap_with_ddp)
 
+    import subprocess
+    print("load", subprocess.check_output("nvidia-smi").decode("utf-8"))
+
     # batch = torch.randint(0, vocab_size, (global_batch_size // data_parallel_size, seq_len), device="cuda")
     batch_size = global_batch_size // data_parallel_size
 
@@ -85,11 +91,11 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
             models[0].parameters(),
             lr=lr,
             weight_decay=weight_decay,
-            process_group=parallel_state.get_data_parallel_group(),
+            process_group=torch.distributed.distributed_c10d._get_default_group(),
             dtype=torch.bfloat16,
             store_params=False,
             # TODO distribute over DP group?
-            distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
+            distributed_process_group=parallel_state.get_model_parallel_group(),
             redundant_process_group=parallel_state.get_data_parallel_group(),
         )
         optimizer.init_param_buffer()
@@ -101,6 +107,9 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
             lr=lr,
             weight_decay=weight_decay
         )
+    
+    import subprocess
+    print("optim", subprocess.check_output("nvidia-smi").decode("utf-8"))
     
     run = wandb.init(
         mode="offline",
