@@ -17,6 +17,26 @@ import fire
 import os
 
 
+# from https://gist.github.com/MFreidank/821cc87b012c53fade03b0c7aba13958
+class InfiniteDataLoader(torch.utils.data.DataLoader):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Initialize an iterator over the dataset.
+        self.dataset_iterator = super().__iter__()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            batch = next(self.dataset_iterator)
+        except StopIteration:
+            # Dataset exhausted, use a new fresh iterator.
+            self.dataset_iterator = super().__iter__()
+            batch = next(self.dataset_iterator)
+        return batch
+
+
 def loss_fn(pred, label, logprobs, beta=0.1):
     losses = tensor_parallel.vocab_parallel_cross_entropy(pred.contiguous(), label.contiguous())
     mask = label >= 0
@@ -50,12 +70,13 @@ MODEL_TYPE = os.environ.get("MODEL_TYPE") or "neox"
 def main(models, kwargs, data_dir=Path("data/logprob"),
          grad_acc: int = 8,
          distributed_adam: bool = True,
-         lr: float = 1e-5,
+         lr: float = 1e-4,
          weight_decay: float = 1e-6,
          global_batch_size: int = 1,
          micro_batch_size: int = 1,
          save_dir = "./save_dir",
-         save_every: int = 100
+         save_every: int = 100,
+         train_steps: int = 100
          ):
     rank, data_parallel_size, model_dir, forward_backward_func, use_sp, wrap_with_ddp, model_args, world_size = [
         kwargs[k] for k in
@@ -78,7 +99,7 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
     batch_size = global_batch_size // data_parallel_size
 
     dataset = StreamingDataset(local=data_dir, shuffle=False)
-    dl = torch.utils.data.DataLoader(dataset, shuffle=False, batch_size=batch_size)
+    dl = InfiniteDataLoader(dataset, shuffle=False, batch_size=batch_size)
 
     if distributed_adam:
         optimizer = DistributedFusedAdam(
@@ -114,7 +135,7 @@ def main(models, kwargs, data_dir=Path("data/logprob"),
     # run.log_artifact(artifact)
 
     total_loss = 0
-    for i, sample in enumerate(bar := (tqdm(dl) if is_writer else dl)):
+    for i, sample in zip(range(train_steps), (bar := (tqdm(dl, total=train_steps) if is_writer else dl))):
         torch.distributed.barrier()
         loss = forward_backward_func(
             train_step,
