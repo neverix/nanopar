@@ -57,8 +57,13 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
          global_batch_size = 32,
          micro_batch_size = 32,
          seq_len = 2049,
-         compare_to_fb_llama: bool = False
+         compare_to_fb_llama: bool = False,
+         preserve_output: bool = True
          ):
+    if preserve_output and os.path.exists(output_dir):
+        print("Output exists")
+        return
+
     rank, local_rank, data_parallel_size, model_args, model_dir, use_sp, wrap_with_ddp, forward_backward_func = [
         kwargs[k] for k in
         ["rank", "local_rank", "data_parallel_size", "model_args", "model_dir", "use_sp", "wrap_with_ddp", "forward_backward_func"]]
@@ -98,7 +103,6 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
     dl = torch.utils.data.DataLoader(dataset, shuffle=False, batch_size=batch_size)
     streaming.base.util.clean_stale_shared_memory()
     next(iter(dl))
-    
     shutil.rmtree(output_dir, ignore_errors=True)
     os.makedirs(output_dir, exist_ok=True)
     out = None
