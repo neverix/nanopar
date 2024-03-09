@@ -21,4 +21,4 @@ export NVTE_FRAMEWORK=pytorch   # Optionally set framework
 python -m pip install .                   # Build and install
 cd ..
 
-python -m pip install -q mosaicml-streaming sentencepiece pandas pyarrow fire wandb einops
+python -m pip install -q git+https://github.com/mosaicml/streaming sentencepiece pandas pyarrow fire wandb einops

@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from contextlib import nullcontext
+from functools import partial
 from typing import Optional
 from pathlib import Path
 from copy import copy
@@ -197,19 +198,23 @@ def main_with_model(model_provider, model_args_cls):
             # if local_rank == 0:
             #     print(subprocess.check_output("nvidia-smi").decode("utf-8"), flush=True)
         
-            return main_fn(models, dict(
-                rank=rank,
-                local_rank=local_rank,
-                data_parallel_size=data_parallel_size,
-                model_args=model_args,
-                model_dir=model_dir,
-                tp_rank=tp_rank,
-                pp_rank=pp_rank,
-                use_sp=use_sp,
-                wrap_with_ddp=wrap_with_ddp,
-                forward_backward_func=forward_backward_func,
-                world_size=world_size
-                ), *args, **kwargs)
+            run_context = nullcontext
+            if use_te:
+                run_context = partial(transformer_engine.pytorch.fp8_autocast_region, enabled=True)
+            with run_context():
+                return main_fn(models, dict(
+                    rank=rank,
+                    local_rank=local_rank,
+                    data_parallel_size=data_parallel_size,
+                    model_args=model_args,
+                    model_dir=model_dir,
+                    tp_rank=tp_rank,
+                    pp_rank=pp_rank,
+                    use_sp=use_sp,
+                    wrap_with_ddp=wrap_with_ddp,
+                    forward_backward_func=forward_backward_func,
+                    world_size=world_size
+                    ), *args, **kwargs)
         return main
     return decorator
 

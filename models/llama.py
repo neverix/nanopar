@@ -7,6 +7,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import transformer_engine.pytorch as te
 
 
 @dataclass
@@ -28,22 +29,22 @@ class ModelArgs:
     use_sp: bool = False
 
 
-class ColumnParallelLinear(tensor_parallel.ColumnParallelLinear):
+class ColumnParallelLinear(te.Linear):
     def __init__(self, in_dim, out_dim, dtype=torch.float32, use_sp: bool = False):
         super().__init__(
             in_dim,
             out_dim,
             bias=False,
-            gather_output=False,
             params_dtype=dtype,
-            sequence_parallel_enabled=use_sp,
-            no_async_tensor_model_parallel_allreduce=use_sp,
+            sequence_parallel=use_sp,
+            tp_group=parallel_state.get_tensor_model_parallel_group(),
+            parallel_mode="column"
         )
     
-    def forward(self, x):
-        # ignore bias
-        result, _ = super().forward(x)
-        return result
+    # def forward(self, x):
+    #     # ignore bias
+    #     result, _ = super().forward(x)
+    #     return result
 
 
 class RowParallelLinear(tensor_parallel.RowParallelLinear):

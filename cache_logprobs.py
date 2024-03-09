@@ -97,21 +97,23 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
             for k, v in torch.load(str(model_dir / "consolidated.00.pth"), mmap=True).items()},
             strict=False)
     
+    is_writer = parallel_state.is_pipeline_last_stage() and parallel_state.get_tensor_model_parallel_rank() == 0
     # https://github.com/mosaicml/streaming/blob/release/v0.7.1/streaming/multimodal/convert/webvid/extract_webvid_videos.py
     # no special utility for processing StreamingDatasets
-    dataset = StreamingDataset(local=input_dir, shuffle=False)
+    dataset = StreamingDataset(local=input_dir, shuffle=False, replication=parallel_state.get_tensor_model_parallel_world_size())
     dl = torch.utils.data.DataLoader(dataset, shuffle=False, batch_size=batch_size)
+    if is_writer:
+        print(len(dataset), len(dl), batch_size)
     streaming.base.util.clean_stale_shared_memory()
-    next(iter(dl))
     shutil.rmtree(output_dir, ignore_errors=True)
     os.makedirs(output_dir, exist_ok=True)
     out = None
-    is_writer = parallel_state.is_pipeline_last_stage() and parallel_state.get_tensor_model_parallel_rank() == 0
     if is_writer:
         out = MDSWriter(out=str(output_dir), columns={"tokens": "ndarray", "logprobs": "ndarray"}, compression="zstd")
     torch.distributed.barrier()
     for batch in (tqdm if is_writer else lambda x: x)(dl):
         tokens = batch["tokens"]
+        print(tokens.shape)
         tokens = tokens[..., -seq_len:].cuda()
         if test_inference:
             if MODEL_TYPE == "neox":
