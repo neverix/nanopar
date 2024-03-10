@@ -64,9 +64,10 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
         print("Output exists")
         return
 
-    rank, local_rank, data_parallel_size, model_args, model_dir, use_sp, wrap_with_ddp, forward_backward_func = [
+    rank, local_rank, data_parallel_size, model_args, model_dir, use_sp, wrap_with_ddp, forward_backward_func, run_context = [
         kwargs[k] for k in
-        ["rank", "local_rank", "data_parallel_size", "model_args", "model_dir", "use_sp", "wrap_with_ddp", "forward_backward_func"]]
+        ["rank", "local_rank", "data_parallel_size", "model_args", "model_dir", "use_sp", "wrap_with_ddp",
+         "forward_backward_func", "run_context"]]
 
     batch_size = global_batch_size // data_parallel_size
     hidden = model_args.hidden_size if MODEL_TYPE == "neox" else model_args.dim
@@ -113,7 +114,6 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
     torch.distributed.barrier()
     for batch in (tqdm if is_writer else lambda x: x)(dl):
         tokens = batch["tokens"]
-        print(tokens.shape)
         tokens = tokens[..., -seq_len:].cuda()
         if test_inference:
             if MODEL_TYPE == "neox":
@@ -137,18 +137,19 @@ def main(models, kwargs, input_dir=Path("data/orig"), output_dir=Path("data/logp
             )
             return
         
-        result = forward_backward_func(
-            cache_logprob,
-            tokens,
-            models,
-            forward_only=True,
-            # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
-            tensor_shape=(seq_len - 1, micro_batch_size, hidden),
-            dtype=torch.bfloat16,
-            async_comm=False,
-            sync_batch_comm=True,
-            sequence_parallel_enabled=use_sp,
-        )
+        with run_context():
+            result = forward_backward_func(
+                cache_logprob,
+                tokens,
+                models,
+                forward_only=True,
+                # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
+                tensor_shape=(seq_len - 1, micro_batch_size, hidden),
+                dtype=torch.bfloat16,
+                async_comm=False,
+                sync_batch_comm=True,
+                sequence_parallel_enabled=use_sp,
+            )
         
         if compare_to_fb_llama:
             # hack

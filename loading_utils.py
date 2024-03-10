@@ -130,7 +130,8 @@ def main_with_model(model_provider, model_args_cls):
                 
                 tensor_model_parallel_size = 1,
                 pipeline_model_parallel_size = 1,
-                use_te = False,
+                te_params = False,
+                te_forward = False,
                 virtual_pipeline_model_parallel_size: Optional[int] = None,
                 use_sp=False,
                 wrap_with_ddp=False,
@@ -180,7 +181,7 @@ def main_with_model(model_provider, model_args_cls):
             # if local_rank == 0:
             #     print(subprocess.check_output("nvidia-smi").decode("utf-8"), flush=True)
             make_model_context = nullcontext
-            if use_te:
+            if te_params:
                 import transformer_engine
                 fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
                     margin=0, interval=1, fp8_format=transformer_engine.common.recipe.Format.E4M3,
@@ -191,30 +192,27 @@ def main_with_model(model_provider, model_args_cls):
                             wrap_with_ddp,
                             virtual_pipeline_model_parallel_size,
                             args=model_args)
-            # if local_rank == 0:
-            #     print(subprocess.check_output("nvidia-smi").decode("utf-8"), flush=True)
             gc.collect()
             torch.cuda.empty_cache()  # frees ~a lot GB
-            # if local_rank == 0:
-            #     print(subprocess.check_output("nvidia-smi").decode("utf-8"), flush=True)
         
             run_context = nullcontext
-            if use_te:
-                run_context = partial(transformer_engine.pytorch.fp8_autocast_region, enabled=True)
-            with run_context():
-                return main_fn(models, dict(
-                    rank=rank,
-                    local_rank=local_rank,
-                    data_parallel_size=data_parallel_size,
-                    model_args=model_args,
-                    model_dir=model_dir,
-                    tp_rank=tp_rank,
-                    pp_rank=pp_rank,
-                    use_sp=use_sp,
-                    wrap_with_ddp=wrap_with_ddp,
-                    forward_backward_func=forward_backward_func,
-                    world_size=world_size
-                    ), *args, **kwargs)
+            if te_forward:
+                import transformer_engine
+                run_context = partial(transformer_engine.pytorch.fp8_autocast, enabled=True)
+            return main_fn(models, dict(
+                rank=rank,
+                local_rank=local_rank,
+                data_parallel_size=data_parallel_size,
+                model_args=model_args,
+                model_dir=model_dir,
+                tp_rank=tp_rank,
+                pp_rank=pp_rank,
+                use_sp=use_sp,
+                wrap_with_ddp=wrap_with_ddp,
+                forward_backward_func=forward_backward_func,
+                world_size=world_size,
+                run_context=run_context
+                ), *args, **kwargs)
         return main
     return decorator
 

@@ -68,9 +68,10 @@ def main_llama(model_dir: str, params_file: str, *, tokens=None):
 
 @main_with_model(llama_model_provider, ModelArgs)
 def main_nanopar(models, kwargs, *, tokens=None):
-    rank, local_rank, data_parallel_size, model_args, model_dir, use_sp, wrap_with_ddp, forward_backward_func = [
+    rank, local_rank, data_parallel_size, model_args, model_dir, use_sp, wrap_with_ddp, forward_backward_func, run_context = [
         kwargs[k] for k in
-        ["rank", "local_rank", "data_parallel_size", "model_args", "model_dir", "use_sp", "wrap_with_ddp", "forward_backward_func"]]
+        ["rank", "local_rank", "data_parallel_size", "model_args", "model_dir", "use_sp", "wrap_with_ddp",
+         "forward_backward_func", "run_context"]]
 
 
     global_batch_size = micro_batch_size = batch_size = 1
@@ -86,18 +87,19 @@ def main_nanopar(models, kwargs, *, tokens=None):
 
     load_consolidated_llama_weights(models, model_dir / "consolidated.00.pth", wrap_with_ddp)
 
-    result = forward_backward_func(
-        cache_logprob,
-        tokens.cuda(),
-        models,
-        forward_only=True,
-        # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
-        tensor_shape=(tokens.shape[1] - 1, tokens.shape[0], hidden),
-        dtype=torch.bfloat16,
-        async_comm=False,
-        sync_batch_comm=True,
-        sequence_parallel_enabled=use_sp,
-    )
+    with run_context():
+        result = forward_backward_func(
+            cache_logprob,
+            tokens.cuda(),
+            models,
+            forward_only=True,
+            # IO shape? I'm not sure if putting Seq_Len first is used for parallelism
+            tensor_shape=(tokens.shape[1] - 1, tokens.shape[0], hidden),
+            dtype=torch.bfloat16,
+            async_comm=False,
+            sync_batch_comm=True,
+            sequence_parallel_enabled=use_sp,
+        )
     pred = result[0].get("pred", None)
     if pred is None:
         return
@@ -112,7 +114,7 @@ def main_nanopar(models, kwargs, *, tokens=None):
         return pred
 
 
-def main(verification_dir = "verification", verify_text = "Hello world! This is a test.", **kwargs):
+def main(verification_dir = "verification", verify_text = "Hello world! This is not a test.", **kwargs):
     tokenizer = SentencePieceProcessor("model_dir/llama-2-7b/tokenizer.model")
     tokens = tokenizer.Encode(verify_text)
     tokens = torch.LongTensor(tokens).unsqueeze(0)

@@ -40,41 +40,25 @@ class ColumnParallelLinear(te.Linear):
             tp_group=parallel_state.get_tensor_model_parallel_group(),
             parallel_mode="column"
         )
-    
-    # def forward(self, x):
-    #     # ignore bias
-    #     result, _ = super().forward(x)
-    #     return result
 
 
-class RowParallelLinear(tensor_parallel.RowParallelLinear):
+class RowParallelLinear(te.Linear):
     def __init__(self, in_dim, out_dim, dtype=torch.float32, use_sp: bool = False):
         super().__init__(
             in_dim,
             out_dim,
             bias=False,
-            input_is_parallel=True,
             params_dtype=dtype,
-            sequence_parallel_enabled=use_sp
+            tp_group=parallel_state.get_tensor_model_parallel_group(),
+            sequence_parallel=use_sp,
+            parallel_mode="row"
         )
-    
-    def forward(self, x):
-        # ignore bias
-        result, _ = super().forward(x.contiguous())
-        return result
 
 
-class RMSNorm(FusedRMSNorm):
+class RMSNorm(te.RMSNorm):
     def __init__(self, dim: int, eps: float = 1e-6,
                  dtype: torch.dtype = torch.bfloat16, use_sp: bool = False):
-        super().__init__(dim, eps=eps)
-        self.weight.data = self.weight.data.to(dtype)
-        if use_sp:
-            self.weight.sequence_parallel_enabled = use_sp
-
-    def forward(self, x: torch.Tensor):
-        # (Dim) * (B, Seq_Len, Dim) = (B, Seq_Len, Dim)
-        return super().forward(x)
+        super().__init__(dim, eps=eps, sequence_parallel=use_sp, params_dtype=dtype)
 
 
 def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, theta: float = 10000.0):
