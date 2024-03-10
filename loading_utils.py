@@ -4,6 +4,8 @@ from models.neox import NeoXArgs
 from apex.transformer.pipeline_parallel import get_forward_backward_func, build_model
 from apex.transformer import parallel_state, tensor_parallel
 
+import transformer_engine
+
 import numpy as np
 import torch
 
@@ -181,12 +183,9 @@ def main_with_model(model_provider, model_args_cls):
             # if local_rank == 0:
             #     print(subprocess.check_output("nvidia-smi").decode("utf-8"), flush=True)
             make_model_context = nullcontext
-            if te_params:
-                import transformer_engine
-                fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
-                    margin=0, interval=1, fp8_format=transformer_engine.common.recipe.Format.E4M3,
-                )
-                make_model_context = partial(transformer_engine.pytorch.fp8_model_init, enabled=True)
+            fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
+                margin=0, interval=1, fp8_format=transformer_engine.common.recipe.Format.E4M3,
+            )
             with make_model_context():
                 models = build_model(model_provider,
                             wrap_with_ddp,
@@ -194,11 +193,11 @@ def main_with_model(model_provider, model_args_cls):
                             args=model_args)
             gc.collect()
             torch.cuda.empty_cache()  # frees ~a lot GB
-        
-            run_context = nullcontext
-            if te_forward:
-                import transformer_engine
-                run_context = partial(transformer_engine.pytorch.fp8_autocast, enabled=True)
+
+            make_model_context = partial(transformer_engine.pytorch.fp8_model_init, enabled=te_params)
+            
+            run_context = partial(transformer_engine.pytorch.fp8_autocast, enabled=te_forward,
+                                  fp8_recipe=fp8_recipe)
             return main_fn(models, dict(
                 rank=rank,
                 local_rank=local_rank,
