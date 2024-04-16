@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-MODEL_TYPE=nanopar torchrun --nproc-per-node=2 check_activations.py --model_dir model_dir/llama-2-7b ---params_file params.json --tensor_model_parallel_size=2 --te_params=0 --te_forward=0
+MODEL_TYPE=nanopar torchrun --nproc-per-node=2 check_activations.py --model_dir model_dir/llama-2-7b ---params_file params.json --tensor_model_parallel_size=2 --te_params=0` --te_forward=0
 MODEL_TYPE=llama torchrun --nproc-per-node=2 check_activations.py --model_dir model_dir/llama-2-7b ---params_file params.json
 exit
 python create_data.py --train_ds_size=2048
